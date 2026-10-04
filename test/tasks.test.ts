@@ -166,7 +166,7 @@ test('cancel rejects unconfirmed shutdown and retains stopped=false and exclusiv
     const record = await manager.launch({ task: 'SCENARIO_HOLD', access: "full", context: 'none', loadout: t.loadout });
     await assert.rejects(manager.cancel(record.id), /could not confirm shutdown.*injected stop confirmation failure/s);
     assert.equal(record.stopped, false);
-    assert.equal(record.state, 'failed');
+    assert.equal(record.state, 'cancelled'); // Cleanup failure does not rewrite the task outcome.
     assert.throws(() => manager.store.lock(record.id), /locked/);
     assert.equal(manager.store.load()[0].stopped, false);
     await assert.rejects(manager.continue(record.id, 'unsafe'), /not confirmed/);
@@ -283,7 +283,7 @@ test('late startup rejection cannot release an unconfirmed stopped writer lock',
     rejectStartup(new Error('late startup rejection'));
     await assert.rejects(launch, /late startup/);
     assert.equal(record.stopped, false);
-    assert.match(record.error!, /stop unconfirmed/);
+    assert.match(record.recovery?.error ?? '', /stop unconfirmed/);
     assert.throws(() => manager.store.lock(record.id), /locked/);
   } finally { await manager.shutdown(); await t.clean(); }
 });

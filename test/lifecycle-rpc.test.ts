@@ -108,11 +108,11 @@ for (const { hook, timeout } of [{ hook: "INPUT", timeout: false }, { hook: "BEF
     }
     assert.ok(launchError instanceof Error);
     assert.match(launchError.message, timeout ? /timed out.*unknown/ : /stopping/);
-    assert.equal(record.state, "failed");
+    assert.equal(record.state, timeout ? "failed" : "cancelled");
     assert.equal(record.stopped, false);
     assert.throws(() => t.manager.store.lock(record.id), /locked/);
     assert.equal(JSON.parse(readFileSync(t.manager.store.path(record.id), "utf8")).stopped, false);
-    assert.deepEqual(t.results, ["failed"]);
+    assert.deepEqual(t.results, [timeout ? "failed" : "cancelled"]);
   } finally { await t.clean(); }
 });
 

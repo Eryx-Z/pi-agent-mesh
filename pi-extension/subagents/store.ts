@@ -3,6 +3,7 @@ import { dirname, join } from "node:path";
 import { randomUUID } from "node:crypto";
 import { validateLoadout, type Loadout, type AccessMode } from "./loadout.ts";
 import type { ContextMode } from "./context.ts";
+import type { ExecutionBoundary, ProcessIdentity } from "./execution.ts";
 
 export type TaskState = "running" | "waiting" | "completed" | "failed" | "cancelled";
 export interface Question { id: string; title: string; toolCallId?: string; responseSent?: boolean }
@@ -14,6 +15,13 @@ export interface TaskRecord {
   state: TaskState; startedAt: number; updatedAt: number; sessionFile: string;
   loadout: Loadout; output: string; activity: string; log: string[]; questions: Question[];
   error?: string; stopped: boolean; run: number;
+  /** Durable execution identity, separate from the task's terminal outcome. */
+  execution?: { boundary: ExecutionBoundary; launcher?: ProcessIdentity; ready?: boolean;
+    intent: TaskState | "interrupted"; cleanup: "pending" | "confirmed" };
+  recovery?: { phase: "cleaning" | "resuming" | "blocked"; attempts: number; error?: string };
+  recoveryRuns?: number;
+  continuationTask?: string;
+  supplementaryInstructions?: string[];
 }
 export function atomicWrite(path: string, text: string): void {
   mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
@@ -69,10 +77,24 @@ export class TaskStore {
           (r.version === 1 ? typeof r.ownership !== "string" : !["read-only", "full"].includes(r.access ?? "")) || typeof r.sessionFile !== "string" ||
           !["none", "partial", "full"].includes(r.context) || !["running", "waiting", "completed", "failed", "cancelled"].includes(r.state) ||
           typeof r.stopped !== "boolean" || !Number.isInteger(r.run) || !Array.isArray(r.log) || !Array.isArray(r.questions)) throw new Error(`Invalid task record: ${f}`);
-      // Do not reconstruct a live writer from disk. Even after a parent crash it must be inspected, not resumed.
+      if (r.recovery && (!["cleaning", "resuming", "blocked"].includes(r.recovery.phase) ||
+          !Number.isInteger(r.recovery.attempts) || r.recovery.attempts < 0 || r.recovery.attempts > 5)) throw new Error(`Invalid task recovery: ${f}`);
+      if (r.recoveryRuns !== undefined && (!Number.isInteger(r.recoveryRuns) || r.recoveryRuns < 0 || r.recoveryRuns > 1)) throw new Error(`Invalid recovery budget: ${f}`);
+      // Loading is read-only. Only a leased manager may reconcile or mutate this record.
       if (!terminal(r.state) || !r.stopped) {
-        r.state = "failed"; r.stopped = false; r.error = "Interrupted owner: inspect for orphan processes; this session cannot be continued automatically.";
-        r.questions = []; this.save(r);
+        if (!terminal(r.state)) {
+          r.state = "failed";
+          if (r.execution?.intent === "running" || r.execution?.intent === "waiting") r.execution.intent = "interrupted";
+        }
+        r.stopped = false; r.questions = [];
+        r.recovery ??= { phase: r.execution ? "cleaning" : "blocked", attempts: 0,
+          error: r.execution ? undefined : "Legacy execution has no verifiable cleanup boundary; automatically isolated" };
+        if (!r.execution || r.execution.intent === "interrupted") r.error ??= "Interrupted execution; automatic cleanup pending";
+      }
+      if (r.stopped && r.execution?.intent === "interrupted" && (r.recoveryRuns ?? 0) >= 1 && r.recovery?.phase === "resuming") {
+        r.recovery = { phase: "blocked", attempts: r.recovery.attempts,
+          error: "Automatic continuation was reserved before interruption; retry budget consumed, execution isolated" };
+        r.activity = "automatic continuation isolated";
       }
       return r;
     });
@@ -82,10 +104,14 @@ export class TaskStore {
     if (!existsSync(r.sessionFile)) throw new Error("Child session file is missing");
     validateLoadout(r.loadout);
   }
-  lock(id: string): () => void {
-    const path = `${this.path(id)}.lock`;
-    try { writeFileSync(path, JSON.stringify({ pid: process.pid, createdAt: Date.now() }), { flag: "wx", mode: 0o600 }); }
-    catch { throw new Error("Task session is locked by another run; inspect stale locks manually, never auto-resume orphan writers"); }
-    return () => { if (existsSync(path)) unlinkSync(path); };
+  /** Reclaim is allowed only under the owner-wide kernel lease, after boundary cleanup. */
+  lock(id: string, reclaim = false): () => void {
+    const path = `${this.path(id)}.lock`, token = randomUUID();
+    if (reclaim && existsSync(path)) unlinkSync(path);
+    try { writeFileSync(path, JSON.stringify({ pid: process.pid, token, createdAt: Date.now() }), { flag: "wx", mode: 0o600 }); }
+    catch { throw new Error("Task session is locked by another run; automatic recovery must confirm cleanup first"); }
+    return () => {
+      if (existsSync(path) && JSON.parse(readFileSync(path, "utf8")).token === token) unlinkSync(path);
+    };
   }
 }

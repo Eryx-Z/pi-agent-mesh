@@ -55,7 +55,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const value = mode === "full" ? snapshots.get(id) ?? snapshotContext(ctx.sessionManager) : undefined;
     snapshots.delete(id); return value;
   }
-  pi.on("session_start", (_event, ctx) => {
+  pi.on("session_start", async (_event, ctx) => {
     closeDashboards();
     if (interval) clearInterval(interval);
     interval = undefined;
@@ -68,20 +68,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
     const cli = join(packageDir, manifest.bin.pi);
     const dir = join(ctx.sessionManager.getSessionDir(), "rpc-subagents", ctx.sessionManager.getSessionId());
-    manager = new TaskManager(new TaskStore(dir), {
+    manager = await TaskManager.open(new TaskStore(dir), {
       maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
       command: process.execPath, baseArgs: [cli],
       notify(record, kind) {
         if (kind === "result") display.result(record);
         const content = kind === "question"
           ? `Subagent ${record.name} (${record.id}) needs an answer:\n${record.questions.filter(q => !q.responseSent).map(q => `${q.id}: ${q.title}`).join("\n")}\nUse subagent_control action=answer with id, questionId, message.`
-          : `Subagent ${record.name} (${record.id}) ${record.state}.\n${record.error ?? ""}\n${bounded(record.output)}\nSession: ${record.sessionFile}\nStopping is not acceptance: review its validation and shared-workspace changes.`;
+          : `Subagent ${record.name} (${record.id}) ${record.state}.\n${record.error ?? ""}\n${record.recovery?.error ?? ""}\n${bounded(record.output)}\nSession: ${record.sessionFile}\nStopping is not acceptance: review its validation and shared-workspace changes.`;
         pi.sendMessage({ customType: `rpc_subagent_${kind}`, content, display: true, details: { id: record.id, state: record.state } }, { deliverAs: "steer", triggerTurn: true });
       },
     });
     workflows = new WorkflowManager(manager, join(dir, "workflows"), r => {
       pi.sendMessage({ customType: "rpc_workflow_result", content: `${workflowSummary(r)}\nStep completion is not independent acceptance; inspect reports and validation.`, display: true, details: { id: r.id, state: r.state } }, { deliverAs: "steer", triggerTurn: true });
     });
+    manager.startRecovery();
     interval = setInterval(() => { if (manager && ctxForWidget) widget(manager, ctxForWidget, display); }, 500);
     widget(manager, ctx, display);
   });
@@ -91,6 +92,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     interval = undefined; snapshots.clear(); promptOptions = undefined;
     ctxForWidget?.ui.setWidget("rpc-subagents", undefined);
     const old = manager, oldFlows = workflows;
+    old?.fenceRecovery();
     manager = undefined; workflows = undefined; ctxForWidget = undefined;
     try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); }
   });
@@ -126,7 +128,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }, { additionalProperties: false }),
     async execute(_id, p, signal) {
       const m = current(); signal?.throwIfAborted();
-      if (p.action === "list") return result([...m.records.values()].map(taskSummary).join("\n") || "No tasks");
+      if (p.action === "list") return result([...m.records.values()].map(record => taskSummary(record)).join("\n") || "No tasks");
       const id = nonempty(p.id, "id");
       if (p.action === "inspect") return result(detail(m.get(id)));
       if (p.action === "history") return result(toolHistory(m.get(id), p.limit));

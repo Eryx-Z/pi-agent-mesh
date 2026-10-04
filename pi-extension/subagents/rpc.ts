@@ -35,6 +35,8 @@ export class RpcProcess extends EventEmitter {
   private preflightsDrained?: () => void;
   private closed = false;
   private stopping?: Promise<void>;
+  private stopSettled = false;
+  private stopRequested = false;
   private exitPromise: Promise<void>;
   private stderr = "";
   constructor(launch: RpcLaunch, private timeoutMs = 15000, private graceMs = 1500) {
@@ -76,7 +78,7 @@ export class RpcProcess extends EventEmitter {
   }
   send(event: RpcEvent): void {
     if (this.closed) throw new Error("RPC process is closed");
-    if (this.stopping) throw new Error("RPC process is stopping");
+    if (this.stopRequested) throw new Error("RPC process is stopping");
     this.write(event);
   }
   private write(event: RpcEvent): void {
@@ -96,7 +98,7 @@ export class RpcProcess extends EventEmitter {
     }
   }
   request(type: string, fields: Record<string, unknown> = {}): Promise<any> {
-    if (this.closed || this.stopping) return Promise.reject(new Error("RPC process is stopping"));
+    if (this.closed || this.stopRequested) return Promise.reject(new Error("RPC process is stopping"));
     return this.requestWithTimeout(type, fields, this.timeoutMs, true);
   }
   private requestWithTimeout(type: string, fields: Record<string, unknown>, timeoutMs: number, stopOnTimeout: boolean): Promise<any> {
@@ -114,9 +116,18 @@ export class RpcProcess extends EventEmitter {
     });
   }
   stop(): Promise<void> {
+    this.stopRequested = true;
     if (this.stopping) return this.stopping;
-    this.stopping = Promise.resolve().then(() => this.stopProcess());
+    this.stopSettled = false;
+    this.stopping = Promise.resolve().then(() => this.stopProcess()).finally(() => { this.stopSettled = true; });
     return this.stopping;
+  }
+  get exited(): boolean { return this.closed; }
+  get pid(): number | undefined { return this.child.pid; }
+  /** Retry a settled stop failure without submitting new model work. */
+  retryStop(): Promise<void> {
+    if (this.stopSettled) this.stopping = undefined;
+    return this.stop();
   }
   private signal(signal: NodeJS.Signals): void {
     if (!this.child.pid || this.closed) return;

@@ -18,6 +18,10 @@ export function taskSummary(r: TaskRecord, now = Date.now()): string {
   return inline(`${glyph(r.state)} ${r.name} [${r.id}] · ${r.state} · ${elapsed(r, now)} · ${r.activity}`);
 }
 const activeRecords = (records: TaskRecord[]): TaskRecord[] => records.filter(r => r.state === "running" || r.state === "waiting");
+const recoveryStatus = (r: TaskRecord): string => r.recovery?.phase === "cleaning"
+  ? `automatic cleanup · attempt ${r.recovery.attempts}/5`
+  : r.recovery?.phase === "resuming" ? "automatically resuming"
+  : "execution isolated — cleanup cannot be verified";
 const stateColor = (state: TaskRecord["state"]) => ({ running: "accent", waiting: "warning", completed: "success", failed: "error", cancelled: "muted" } as const)[state];
 function widgetHeader(line: string, theme: Theme): string {
   // Consume the existing counts rather than recomputing attention or result windows.
@@ -56,7 +60,7 @@ export class TaskWidget {
     }
     if (!counts.length) return undefined;
     const attention = [
-      ...unsafe.map(r => `! ${r.name} · shutdown unconfirmed — inspect before continuing`),
+      ...unsafe.map(r => `! ${r.name} · shutdown unconfirmed — ${recoveryStatus(r)}`),
       ...pending.map(r => `? ${r.name} · ${r.questions.filter(q => !q.responseSent).map(q => q.title).join("; ")}`),
     ];
     const previews = active.slice(0, 3).map(r => `${glyph(r.state)} ${r.name} · ${elapsed(r, now)} · ${r.activity}`);
@@ -107,6 +111,8 @@ export function detail(r: TaskRecord, live = false): string {
     `Context: ${r.context} · Run: ${r.run}`,
     `Access: ${r.access ?? "legacy — choose access before continuation"}`,
     `Shutdown: ${r.state === "running" || r.state === "waiting" ? "not requested (active run)" : r.stopped ? "confirmed" : "unconfirmed"}`,
+    ...(r.recovery ? [`Recovery: ${recoveryStatus(r)}`, ...(r.recovery.error ? [`Cleanup error: ${r.recovery.error}`] : [])] : []),
+    ...(r.execution ? [`Execution: ${r.execution.boundary.unit} · Cleanup: ${r.execution.cleanup}`] : []),
     ...(r.workflow ? [`Workflow: ${r.workflow.id}, step ${r.workflow.stepId}`] : []),
     `Cwd: ${r.loadout.cwd}`, `Session: ${r.sessionFile}`,
     "\n── Task · Parent prompt ──", r.task,
@@ -174,11 +180,12 @@ export function dashboardDetail(r: TaskRecord, pane: DashboardPane, trace = read
     "Latest assistant text", r.output || "No assistant text yet",
     "\nRecent activity", r.log.join("\n") || "No activity yet",
   ].join("\n"));
-  const shutdown = r.state === "running" || r.state === "waiting" ? "active" : r.stopped ? "confirmed" : "UNCONFIRMED — inspect before continuing";
+  const shutdown = r.state === "running" || r.state === "waiting" ? "active" : r.stopped ? "confirmed" : `UNCONFIRMED — ${recoveryStatus(r)}`;
   return clean([
     `Access: ${r.access ?? "legacy — choose before continuing"} · Context: ${r.context}`,
     `Thinking: ${r.loadout.thinking ?? "unknown"} · Run: ${r.run} · Elapsed: ${elapsed(r, Date.now())}`,
     `Shutdown: ${shutdown}`,
+    ...(r.recovery?.error ? [`Cleanup: ${r.recovery.error}`] : []),
     ...(r.workflow ? [`Workflow step: ${r.workflow.stepId}`] : []),
     `\nNow: ${inline(r.activity)}`,
     ...(r.error ? ["\nError", r.error] : []),

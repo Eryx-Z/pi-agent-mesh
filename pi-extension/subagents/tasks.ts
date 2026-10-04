@@ -1,4 +1,5 @@
 import { join } from "node:path";
+import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { RpcProcess, type RpcEvent, type RpcLaunch } from "./rpc.ts";
 import { CHILD_EXTENSION, validateLoadout, applyAccess, accessMode, type AccessMode, type Loadout } from "./loadout.ts";
@@ -6,6 +7,8 @@ import { atomicWrite, addLog, bounded, uniqueName, TaskStore, type TaskRecord } 
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
 import { diagnoseFailure } from "./diagnostics.ts";
+import { SystemdExecutionController, readProcessIdentity, isProcessIdentityAlive, type ExecutionController } from "./execution.ts";
+import { acquireExecutionLease, type ExecutionLease } from "./lease.ts";
 
 export interface NewTask {
   name?: string; task: string; access: AccessMode; context: ContextMode; contextText?: string;
@@ -15,9 +18,18 @@ export interface NewTask {
 interface LiveRun {
   rpc: RpcProcess; release: () => void; finishing?: Promise<void>; pendingMessages: number;
   startupPhase?: string;
+  cancelRequested?: boolean;
   settled: boolean; lastStop?: string; lastError?: string; started: boolean; askToolCallId?: string;
   persistTimer?: ReturnType<typeof setTimeout>; settleChecking?: boolean; checkAgain?: boolean;
   finalTools: Map<string, boolean>; finalOutput: Map<string, string>; submission: number;
+}
+interface ManagerOptions {
+  command: string; baseArgs?: string[]; maxConcurrent?: number;
+  createRpc?: (launch: RpcLaunch) => RpcProcess;
+  executionController?: ExecutionController;
+  changed?: () => void; notify?: (record: TaskRecord, kind: "result" | "question") => void;
+  /** Tests may shorten delays; production retries are bounded and back off. */
+  recoveryDelayMs?: number;
 }
 export function childLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[] = []): RpcLaunch {
   const l = validateLoadout(record.loadout);
@@ -47,21 +59,46 @@ export class TaskManager {
   readonly records = new Map<string, TaskRecord>();
   private live = new Map<string, LiveRun>();
   private closed = false;
+  private lease?: ExecutionLease;
+  private recoveryWork?: Promise<void>;
+  private recoveryTimer?: ReturnType<typeof setTimeout>;
+  private shuttingDown?: Promise<void>;
   private listeners = new Set<() => void>();
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
   isLive(id: string): boolean { return this.live.has(id); }
   hasCapacity(): boolean { return [...this.records.values()].filter(r => !r.stopped).length < (this.options.maxConcurrent ?? 8); }
-  constructor(readonly store: TaskStore, private options: {
-    command: string; baseArgs?: string[]; maxConcurrent?: number;
-    createRpc?: (launch: RpcLaunch) => RpcProcess;
-    changed?: () => void; notify?: (record: TaskRecord, kind: "result" | "question") => void;
-  }) {
+  /** Acquire directory ownership before task/workflow loading can mutate anything. */
+  static async open(store: TaskStore, options: ManagerOptions): Promise<TaskManager> {
+    if (process.platform !== "linux") return new TaskManager(store, options);
+    let manager: TaskManager | undefined;
+    const lease = await acquireExecutionLease(join(store.dir, ".owner.lease"), () => { void manager?.shutdown(); });
+    try {
+      const path = join(store.dir, ".owner.json"), identity = readProcessIdentity(process.pid);
+      if (!identity) throw new Error("Cannot establish parent process identity; recovery is isolated");
+      if (existsSync(path)) {
+        const previous = JSON.parse(readFileSync(path, "utf8"));
+        if (previous.active !== false && isProcessIdentityAlive(previous.identity)) {
+          throw new Error("Previous parent is still alive; refusing execution ownership takeover");
+        }
+      }
+      manager = new TaskManager(store, { ...options, executionController: options.executionController ?? new SystemdExecutionController() });
+      manager.lease = lease;
+      atomicWrite(path, JSON.stringify({ identity, active: true }));
+      for (const record of manager.records.values()) if (record.recovery) store.save(record);
+      return manager;
+    } catch (error) { await lease.release(); throw error; }
+  }
+  constructor(readonly store: TaskStore, private options: ManagerOptions) {
     if (!Number.isInteger(options.maxConcurrent ?? 8) || (options.maxConcurrent ?? 8) < 1) throw new Error("maxConcurrent must be a positive integer");
     for (const record of store.load()) this.records.set(record.id, record);
   }
-  private save(record: TaskRecord): void {
-    record.updatedAt = Date.now(); this.store.save(record); this.options.changed?.();
-    for (const listener of this.listeners) listener();
+  assertOwnership(): void {
+    if (this.lease && !this.lease.alive) throw new Error("Execution ownership lease was lost; manager is fenced");
+  }
+  private save(record: TaskRecord, announce = true): void {
+    this.assertOwnership();
+    record.updatedAt = Date.now(); this.store.save(record);
+    if (announce) { this.options.changed?.(); for (const listener of this.listeners) listener(); }
   }
   get(id: string): TaskRecord {
     const record = this.records.get(id) ?? [...this.records.values()].find(r => r.name === id);
@@ -91,18 +128,26 @@ export class TaskManager {
     await this.start(record, prompt);
     return record;
   }
-  async continue(id: string, message: string, access?: AccessMode, workflowId?: string): Promise<TaskRecord> {
+  async continue(id: string, message: string, access?: AccessMode, workflowId?: string, automatic = false): Promise<TaskRecord> {
     if (this.closed) throw new Error("Parent session is shutting down");
     if (!message.trim()) throw new Error("Continuation message is required");
     const record = this.get(id);
+    if (!automatic && record.recovery && record.recovery.phase !== "blocked") throw new Error("Task automatic recovery is pending");
     if (record.workflow && record.workflow.id !== workflowId) throw new Error("Use workflow_control retry for workflow steps");
     const selected = accessMode(access ?? record.access);
     const available = record.availableLoadout ?? record.loadout;
     const effective = applyAccess(available, selected);
+    if (this.live.get(record.id)?.finishing && !record.stopped) throw new Error("Task shutdown is not confirmed; automatic cleanup pending");
     if (this.live.has(record.id)) throw new Error("Task is already running or stopping");
     this.store.validateForContinue(record);
     if (!this.hasCapacity()) throw new Error("Global subagent concurrency limit reached; wait for a child to stop");
     const release = this.store.lock(record.id);
+    if (!automatic) {
+      record.recoveryRuns = 0;
+      record.continuationTask = message;
+      record.supplementaryInstructions = [];
+    }
+    record.recovery = undefined;
     record.version = 2; record.access = selected; record.availableLoadout = structuredClone(available); record.loadout = effective;
     record.state = "running"; record.stopped = false; record.run++; record.error = undefined;
     record.questions = []; record.output = ""; record.startedAt = Date.now(); record.activity = "starting continuation";
@@ -117,27 +162,41 @@ export class TaskManager {
     let spawned = false;
     let phase = "launch";
     try {
+      this.assertOwnership();
+      if (this.closed) throw new Error("Parent session is shutting down");
       release ??= this.store.lock(record.id);
-      const launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs);
+      let launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs);
+      const boundary = this.lease ? this.options.executionController?.prepare(record.id, record.run) : undefined;
+      record.execution = boundary ? { boundary, intent: "running", cleanup: "pending" } : undefined;
+      this.save(record); // Identity is durable before the launcher can create a scope.
+      if (boundary) launch = this.options.executionController!.wrap(launch, boundary);
       const rpc = (this.options.createRpc ?? (l => new RpcProcess(l)))(launch);
       const live: LiveRun = { rpc, release, startupPhase: phase, pendingMessages: 1, settled: false, started: false, finalTools: new Map(), finalOutput: new Map(), submission: 0 };
       this.live.set(record.id, live);
       spawned = true;
+      if (record.execution) {
+        record.execution.launcher = rpc.pid ? readProcessIdentity(rpc.pid) : undefined;
+        this.save(record); // Missing identity after a crash is isolated, never guessed.
+      }
       rpc.on("event", event => {
         try { this.event(record, live, event); }
         catch (e) { void this.finish(record, "failed", String(e)); }
       });
-      rpc.on("fault", error => { void this.finish(record, "failed", String(error)); });
+      rpc.on("fault", error => { if (!live.finishing) void this.finish(record, "failed", String(error), !live.startupPhase); });
       rpc.on("closed", detail => {
-        if (!live.finishing) void this.finish(record, "failed", `Unexpected child exit: ${detail.code ?? detail.signal}\n${detail.stderr}`);
+        if (!live.finishing) void this.finish(record, "failed", `Unexpected child exit: ${detail.code ?? detail.signal}\n${detail.stderr}`, !live.startupPhase);
       });
       phase = live.startupPhase = "RPC readiness";
       await rpc.request("get_state"); // readiness, not a timed sleep
+      this.assertOwnership();
+      if (this.closed || live.finishing) throw new Error("Parent session closed during startup");
+      if (record.execution) { record.execution.ready = true; this.save(record); }
       await rpc.request("set_auto_retry", { enabled: false });
       phase = live.startupPhase = "loadout preflight";
       const commands = await rpc.request("get_commands");
       if (!commands?.commands?.some((c: { name: string }) => c.name === "rpc-subagent-preflight")) throw new Error("Child bridge did not load; refusing to send any model prompt");
       await rpc.request("prompt", { message: "/rpc-subagent-preflight" });
+      this.assertOwnership();
       if (live.finishing || this.closed) throw new Error("Child failed during preflight");
       phase = live.startupPhase = "initial prompt";
       await rpc.request("prompt", { message: prompt });
@@ -148,7 +207,9 @@ export class TaskManager {
     } catch (e) {
       if (spawned) await this.finish(record, "failed", String(e));
       else {
-        release?.(); record.state = "failed"; record.error = diagnoseFailure(String(e), record.loadout, phase); record.stopped = true; this.save(record);
+        release?.(); record.state = "failed"; record.error = diagnoseFailure(String(e), record.loadout, phase); record.stopped = true;
+        if (record.execution) { record.execution.intent = "failed"; record.execution.cleanup = "confirmed"; }
+        this.save(record);
       }
       throw new Error(diagnoseFailure(String(e), record.loadout, phase), { cause: e });
     }
@@ -238,7 +299,7 @@ export class TaskManager {
         if (live.checkAgain) { live.checkAgain = false; this.maybeComplete(record, live); }
       });
   }
-  private finish(record: TaskRecord, state: TaskRecord["state"], error?: string): Promise<void> {
+  private finish(record: TaskRecord, state: TaskRecord["state"], error?: string, interrupted = false): Promise<void> {
     const live = this.live.get(record.id);
     if (!live) return Promise.resolve();
     if (live.finishing) return live.finishing;
@@ -246,20 +307,124 @@ export class TaskManager {
     // Install promise before stopping: close/fault callbacks must never finalize twice.
     if (live.persistTimer) clearTimeout(live.persistTimer);
     live.finishing = Promise.resolve().then(async () => {
-      record.state = state; record.error = error; record.questions = []; record.activity = "stopping process";
+      record.state = live.cancelRequested ? "cancelled" : state;
+      record.error = live.cancelRequested ? "Cancelled by parent" : error;
+      record.questions = []; record.activity = "stopping process";
+      if (record.execution) record.execution.intent = !live.cancelRequested && interrupted ? "interrupted" : record.state;
+      let persistenceError: unknown;
+      try { this.save(record, false); } catch (e) { persistenceError = e; }
+      // Even a persistence/lease failure must stop this manager's already-owned RPC.
       try {
-        await live.rpc.stop(); record.stopped = true; live.release();
-      } catch (e) { record.state = "failed"; record.error = `${error ?? ""}\n${e}`; record.stopped = false; }
-      this.live.delete(record.id); record.activity = record.state;
-      this.save(record);
-      if (!this.closed) this.options.notify?.(record, "result");
-    }).catch(e => { record.state = "failed"; record.error = String(e); record.stopped = false; this.live.delete(record.id); });
+        let stopError: unknown;
+        try { await live.rpc.stop(); } catch (e) { stopError = e; }
+        if (record.execution) await this.confirmBoundary(record, live);
+        else if (stopError) throw stopError;
+        if (persistenceError) throw persistenceError;
+        this.completeCleanup(record, live);
+        if (!this.closed && record.execution?.intent === "interrupted" && !record.workflow && (record.recoveryRuns ?? 0) < 1) {
+          record.recovery = { phase: "cleaning", attempts: 0 };
+          this.save(record); this.scheduleRecovery();
+        } else if (!this.closed) this.options.notify?.(record, "result");
+      } catch (e) {
+        record.stopped = false;
+        record.recovery = { phase: record.execution ? "cleaning" : "blocked", attempts: 0, error: String(e) };
+        record.activity = record.execution ? "automatic cleanup pending" : record.state;
+        this.save(record);
+        // Keep the RPC handle and release callback: stop failure must remain retryable.
+        if (record.execution) this.scheduleRecovery();
+        else if (!this.closed) this.options.notify?.(record, "result");
+      }
+    }).catch(e => { record.stopped = false; record.recovery = { phase: "blocked", attempts: 0, error: String(e) }; });
     return live.finishing;
+  }
+  private async confirmBoundary(record: TaskRecord, live?: LiveRun): Promise<void> {
+    if (!live) this.assertOwnership(); // A fenced manager may still stop its own live execution.
+    const execution = record.execution;
+    if (!this.lease || !execution || !this.options.executionController) throw new Error("No verifiable execution boundary; automatically isolated");
+    // Readiness seals scope creation. Otherwise a late orphan launcher could create
+    // a scope after a 'not found' check; only proven launcher death seals that race.
+    if (!execution.ready && !(live?.rpc.exited || (execution.launcher && !isProcessIdentityAlive(execution.launcher)))) {
+      throw new Error("Execution launcher has not settled; cleanup remains unconfirmed");
+    }
+    if (!live && !execution.launcher) throw new Error("Execution launcher identity missing; automatically isolated");
+    await this.options.executionController.cleanup(execution.boundary);
+    if (live && !live.rpc.exited) { try { await live.rpc.retryStop(); } catch { /* proof below */ } }
+    if (live ? !live.rpc.exited : isProcessIdentityAlive(execution.launcher!)) {
+      throw new Error("Execution boundary is empty but launcher exit is not yet confirmed");
+    }
+  }
+  private completeCleanup(record: TaskRecord, live?: LiveRun): void {
+    record.stopped = true; record.recovery = undefined;
+    if (record.error === "Interrupted execution; automatic cleanup pending") record.error = "Previous execution interrupted; cleanup confirmed";
+    if (record.execution) record.execution.cleanup = "confirmed";
+    record.activity = record.state;
+    this.save(record);
+    if (live) { live.release(); this.live.delete(record.id); }
+    else this.store.lock(record.id, true)(); // Leased directory + confirmed boundary, no stale-unlink race.
+  }
+  /** Called once after workflow listeners are installed; no model polling required. */
+  startRecovery(): void {
+    if (this.closed) return;
+    if (!this.lease) return;
+    void this.recover();
+  }
+  private scheduleRecovery(): void {
+    if (this.closed || this.recoveryTimer || !this.lease) return;
+    const pending = [...this.records.values()].filter(r => r.execution && r.recovery?.phase === "cleaning" &&
+      (!r.stopped || r.execution.intent === "interrupted" && !r.workflow && (r.recoveryRuns ?? 0) < 1));
+    if (!pending.length) return;
+    const attempts = Math.min(...pending.map(r => r.recovery?.attempts ?? 0));
+    this.recoveryTimer = setTimeout(() => { this.recoveryTimer = undefined; void this.recover(); },
+      this.options.recoveryDelayMs ?? Math.min(30000, 1000 * 2 ** attempts));
+    this.recoveryTimer.unref();
+  }
+  private recover(): Promise<void> {
+    if (this.recoveryWork) return this.recoveryWork;
+    this.recoveryWork = Promise.resolve().then(async () => {
+      for (const record of this.records.values()) {
+        if (this.closed) break;
+        const live = this.live.get(record.id);
+        const interrupted = record.execution?.intent === "interrupted" && !record.workflow && (record.recoveryRuns ?? 0) < 1;
+        if ((record.stopped && !interrupted) || !record.execution || (live && !live.finishing) || record.recovery?.phase === "blocked") continue;
+        if (live?.finishing) await live.finishing;
+        if (record.stopped && !(record.execution.intent === "interrupted" && !record.workflow && (record.recoveryRuns ?? 0) < 1)) continue;
+        const run = record.run;
+        record.recovery = { phase: "cleaning", attempts: (record.recovery?.attempts ?? 0) + 1 };
+        record.activity = "automatically cleaning previous execution";
+        this.save(record);
+        try {
+          if (!record.stopped) await this.confirmBoundary(record, live);
+          if (record.execution.intent !== "interrupted") record.state = record.execution.intent;
+          this.completeCleanup(record, live);
+          if (record.execution.intent === "interrupted" && !record.workflow && !this.closed && (record.recoveryRuns ?? 0) < 1) {
+            record.recoveryRuns = (record.recoveryRuns ?? 0) + 1;
+            record.recovery = { phase: "resuming", attempts: 0 };
+            this.save(record); // Reserve the attempt durably before any new prompt.
+            await this.continue(record.id,
+              `Recover the interrupted task using the retained session history. First inspect existing results and partial tool effects. Do not blindly repeat side effects or treat interruption as rollback. Keep all original restrictions and finish only remaining work. Original task:\n${record.task}` +
+                (record.continuationTask ? `\nLatest continuation instruction (takes precedence):\n${record.continuationTask}` : "") +
+                (record.supplementaryInstructions?.length ? `\nSupplementary instructions submitted by the parent (receipt/execution may be unknown):\n${record.supplementaryInstructions.join("\n\n")}` : ""),
+              record.access, undefined, true);
+          } else if (!this.closed) this.options.notify?.(record, "result");
+        } catch (error) {
+          if (this.closed) break;
+          if (record.run !== run) continue; // The replacement run owns its own cleanup/outcome now.
+          const attempts = record.recovery?.attempts ?? 5;
+          record.recovery = { phase: attempts >= 5 ? "blocked" : "cleaning", attempts, error: String(error) };
+          record.activity = attempts >= 5 ? "automatically isolated after cleanup retries" : "automatic cleanup retry pending";
+          this.save(record);
+          if (attempts >= 5) this.options.notify?.(record, "result");
+        }
+      }
+    }).catch(() => { /* Ownership loss is fail-closed; shutdown owns remaining cleanup. */ })
+      .finally(() => { this.recoveryWork = undefined; this.scheduleRecovery(); });
+    return this.recoveryWork;
   }
   async message(id: string, message: string): Promise<void> {
     if (!message.trim()) throw new Error("Message is required");
     const record = this.get(id), live = this.live.get(record.id);
     if (!live || live.finishing) throw new Error("Task is not running; use continue explicitly");
+    if (live.startupPhase) throw new Error("Task is still starting; send supplementary instructions after startup is accepted");
     if (record.questions.length) throw new Error("Task is waiting for an answer; reply with its question ID");
     // A settled run cannot prove that a new submission started. Input hooks may
     // consume it without emitting another agent_start/agent_settled pair.
@@ -267,7 +432,11 @@ export class TaskManager {
     live.submission++;
     live.pendingMessages++; live.settled = false;
     try {
+      record.supplementaryInstructions = [...record.supplementaryInstructions ?? [], message];
+      this.save(record, false); // Preserve unacknowledged instructions across owner death.
       await live.rpc.request("prompt", { message: `Supplementary parent instruction:\n${message}`, streamingBehavior: "steer" });
+      // Queued receipts do not prove history persistence/execution; retain directives
+      // until an explicit new continuation supersedes this run.
       addLog(record, `Supplement accepted/queued (not yet proven executed): ${message}`); this.save(record);
     } catch (e) {
       // Do not strand a formerly settled run after clearing its settled flag.
@@ -286,13 +455,41 @@ export class TaskManager {
     addLog(record, `Answer sent for ${questionId}: ${answer}`); this.save(record);
   }
   async cancel(id: string): Promise<void> {
-    const record = this.get(id);
-    if (!this.live.has(record.id)) throw new Error("Task is not running");
-    await this.finish(record, "cancelled", "Cancelled by parent");
-    if (!record.stopped) throw new Error(`Cancellation could not confirm shutdown; continuation disabled: ${record.error ?? "unknown stop failure"}`);
+    const record = this.get(id), live = this.live.get(record.id);
+    if (!live && record.execution?.intent !== "interrupted" && (record.stopped || !record.recovery)) throw new Error("Task is not running");
+    if (!(live?.finishing && record.state === "completed")) {
+      if (live) live.cancelRequested = true;
+      // Cancellation fences resumption even while an older finish/cleanup is awaited.
+      if (record.execution) record.execution.intent = "cancelled";
+      record.state = "cancelled"; record.error = "Cancelled by parent";
+      if (record.stopped) record.recovery = undefined;
+      this.save(record, false);
+    }
+    if (live) await this.finish(record, "cancelled", "Cancelled by parent");
+    if (!record.stopped) throw new Error(`Cancellation could not confirm shutdown; automatic cleanup pending: ${record.recovery?.error ?? record.error ?? "unknown stop failure"}`);
   }
-  async shutdown(): Promise<void> {
+  fenceRecovery(): void {
     this.closed = true;
-    await Promise.all([...this.live.keys()].map(id => this.finish(this.get(id), "cancelled", "Parent session closed/reloaded")));
+    if (this.recoveryTimer) clearTimeout(this.recoveryTimer);
+  }
+  shutdown(): Promise<void> {
+    if (this.shuttingDown) return this.shuttingDown;
+    this.fenceRecovery(); // Fence all recovery/start permissions before the first await.
+    this.shuttingDown = (async () => {
+      await this.recoveryWork;
+      await Promise.all([...this.live.keys()].map(id => this.finish(this.get(id), "cancelled", "Parent session closed/reloaded", true)));
+      // Retry unresolved cleanup once during shutdown; never launch a replacement here.
+      for (const [id, live] of this.live) {
+        const record = this.get(id);
+        if (!record.execution) continue;
+        try { await this.confirmBoundary(record, live); this.completeCleanup(record, live); } catch { /* persisted isolation */ }
+      }
+      if (this.lease) {
+        try {
+          if (this.lease.alive) atomicWrite(join(this.store.dir, ".owner.json"), JSON.stringify({ identity: readProcessIdentity(), active: false }));
+        } finally { await this.lease.release(); }
+      }
+    })();
+    return this.shuttingDown;
   }
 }

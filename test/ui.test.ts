@@ -188,7 +188,7 @@ test("widget card emphasizes structured names and semantic counts without extra 
   assert.deepEqual(rendered, [
     "┌─ Subagents · 1 awaiting answer · 1 shutdown unconfirmed · /subagents",
     "│ ? auth · 中文 [running] · 0s · read: auth.ts",
-    "│ ! unsafe · shutdown unconfirmed — inspect before continuing",
+    "│ ! unsafe · shutdown unconfirmed — execution isolated — cleanup cannot be verified",
     "│ ? auth · 中文 [running] · Which interface?",
   ]);
   for (const pair of [

@@ -73,16 +73,21 @@ export class WorkflowManager {
         const task = this.findTask(r, step);
         if (task) step.taskId = task.id;
         if (step.state === "running" || step.state === "pending" && task) {
-          step.state = task?.stopped && task.state === "completed" && (r.workspace !== "isolated" || step.worktree?.output) ? "completed" : "failed";
-          if (step.state === "failed") step.error = "Interrupted workflow; inspect child and explicitly retry";
+          // Completion and cleanup are separate. Keep successful work pending
+          // reconciliation/capture; never turn it into an instruction to rerun it.
+          step.state = task?.state === "completed"
+            ? task.stopped && (r.workspace !== "isolated" || step.worktree?.output) ? "completed" : "running"
+            : "failed";
+          if (step.state === "failed") step.error = "Interrupted workflow; explicitly retry after automatic cleanup";
         }
       }
       if (r.state === "running") { r.state = "paused"; r.error = "Owner restarted; inspect and explicitly resume"; }
       this.save(r);
     }
     this.unsubscribe = tasks.subscribe(() => this.schedule());
+    if ([...this.records.values()].some(r => r.steps.some(s => s.state === "running" && this.findTask(r, s)?.state === "completed"))) this.schedule();
   }
-  private save(r: WorkflowRecord): void { r.updatedAt = Date.now(); atomicWrite(join(this.dir, `${r.id}.json`), JSON.stringify(r, null, 2)); }
+  private save(r: WorkflowRecord): void { this.tasks.assertOwnership(); r.updatedAt = Date.now(); atomicWrite(join(this.dir, `${r.id}.json`), JSON.stringify(r, null, 2)); }
   get(id: string): WorkflowRecord {
     const r = this.records.get(id) ?? [...this.records.values()].find(r => r.name === id);
     if (!r) throw new Error(`Unknown workflow: ${id}`);
@@ -131,14 +136,19 @@ export class WorkflowManager {
           }
         }
       }
-    }).finally(() => { this.pumping = false; });
+    }).finally(() => {
+      this.pumping = false;
+      // A task can finish after the loop's final check but before this microtask.
+      if (this.scheduled && !this.closed) this.schedule();
+    });
   }
   private reconcile(r: WorkflowRecord): void {
     let changed = false, failed = false;
     for (const s of r.steps.filter(s => s.state === "running")) {
       const t = this.findTask(r, s);
       if (t && (t.state === "failed" || t.state === "cancelled") && r.state === "running") { failed = true; changed = true; }
-      if (!t || this.tasks.isLive(t.id) || t.state === "running" || t.state === "waiting") continue;
+      if (!t || this.tasks.isLive(t.id) || t.state === "running" || t.state === "waiting" ||
+          t.state === "completed" && !t.stopped) continue;
       s.taskId = t.id;
       if (r.workspace === "isolated" && t.stopped && t.state === "completed" && !s.worktree?.output) continue;
       s.state = t.stopped && t.state === "completed" ? "completed" : t.state === "cancelled" ? "cancelled" : "failed";
@@ -154,12 +164,18 @@ export class WorkflowManager {
   }
   private async collect(r: WorkflowRecord): Promise<void> {
     if (r.workspace !== "isolated" || this.cleaning.has(r.id)) return;
+    const failures: string[] = [];
     for (const s of this.active(r)) {
       const task = this.findTask(r, s);
       if (task?.stopped && task.state === "completed" && !this.tasks.isLive(task.id) && s.worktree && !s.worktree.output) {
         try { await capture(s.worktree); this.save(r); }
-        catch (e) { s.state = "failed"; s.error = String(e); throw e; }
+        catch (e) { s.state = "failed"; s.error = String(e); failures.push(`Step ${s.id}: ${s.error}`); }
       }
+    }
+    if (failures.length) {
+      // Settle captured siblings before pausing: retry must not see stopped children as active.
+      this.reconcile(r);
+      throw new Error(`Workflow capture failed:\n${failures.join("\n")}`);
     }
   }
   private async dispatch(r: WorkflowRecord): Promise<void> {
@@ -236,7 +252,8 @@ export class WorkflowManager {
     if (this.cleaning.has(r.id)) throw new Error("Wait for workspace cleanup before resuming");
     if (r.state !== "paused") throw new Error("Only paused workflows can resume");
     if (this.unsafe(r)) throw new Error("Unconfirmed child shutdown; cannot resume");
-    if (r.steps.some(s => s.state === "failed" || s.state === "cancelled")) throw new Error("Explicitly retry failed/cancelled steps before resume");
+    if (r.steps.some(s => s.state === "failed" || s.state === "cancelled" ||
+        ["failed", "cancelled"].includes(this.findTask(r, s)?.state ?? ""))) throw new Error("Explicitly retry failed/cancelled steps before resume");
     validateLoadout(r.loadout);
     r.state = "running"; r.error = undefined; this.save(r); this.schedule();
   }

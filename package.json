@@ -1,5 +1,5 @@
 {
-  "name": "pi-interactive-subagents",
+  "name": "pi-agent-mesh",
   "version": "4.0.1",
   "description": "Context-based shared-workspace subagents over Pi RPC, inheriting parent tools and skills",
   "keywords": [
