@@ -45,9 +45,9 @@ for (const operation of ["new", "resume"] as const) {
   });
 }
 
-test("delegation schemas describe partial as the default and its explicit context requirement", () => {
+test("delegation schemas describe partial as the default and its explicit context requirement", async () => {
   const tools: any[] = [];
-  entry({ on() {}, registerTool: (tool: any) => tools.push(tool), registerCommand() {}, registerMessageRenderer() {} } as any);
+  await entry({ on() {}, registerTool: (tool: any) => tools.push(tool), registerCommand() {}, registerMessageRenderer() {}, registerToolRenderer() {} } as any);
   for (const name of ["subagent", "workflow_run"]) {
     const schema = tools.find(tool => tool.name === name).parameters;
     assert.match(schema.properties.context.description, /partial \(default\) requires contextText/);

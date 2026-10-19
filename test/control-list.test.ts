@@ -19,25 +19,27 @@ test('control list uses current time rather than array indexes for active tasks'
   } as TaskRecord));
   t.mock.method(Date, 'now', () => now);
   t.mock.method(TaskStore.prototype, 'load', () => records);
-  const handlers = new Map<string, (...args: any[]) => any>();
+  const handlers = new Map<string, ((...args: any[]) => any)[]>();
+  const emit = async (name: string, ...args: any[]) => { for (const handler of handlers.get(name) ?? []) await handler(...args); };
   const tools: any[] = [];
-  entry({
-    on: (name: string, handler: (...args: any[]) => any) => handlers.set(name, handler),
-    registerTool: (tool: any) => tools.push(tool), registerCommand() {}, registerMessageRenderer() {},
+  await entry({
+    on: (name: string, handler: (...args: any[]) => any) => { const all = handlers.get(name) ?? []; all.push(handler); handlers.set(name, all); return () => {}; },
+    getSettings: () => ({ extensions: ['-builtin:mcp'] }),
+    registerTool: (tool: any) => tools.push(tool), registerCommand() {}, registerMessageRenderer() {}, registerToolRenderer() {},
   } as any);
   try {
-    await handlers.get('session_start')!({}, {
-      hasUI: false, ui: { setWidget() {} },
+    await emit('session_start', {}, {
+      cwd: dir, hasUI: false, ui: { setWidget() {}, notify() {}, setStatus() {} },
       sessionManager: {
         getSessionFile: () => join(dir, 'parent.jsonl'),
-        getSessionDir: () => dir, getSessionId: () => 'parent',
+        getSessionDir: () => dir, getSessionId: () => 'parent', getBranch: () => [],
       },
     });
     const result = await tools.find(tool => tool.name === 'subagent_control').execute('call', { action: 'list' });
     assert.match(result.content[0].text, /task-0 .*running · 1m 5s/);
     assert.match(result.content[0].text, /task-1 .*waiting · 2m 5s/);
   } finally {
-    await handlers.get('session_shutdown')!();
+    await emit('session_shutdown');
     rmSync(dir, { recursive: true, force: true });
   }
 });

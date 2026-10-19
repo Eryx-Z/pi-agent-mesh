@@ -5,10 +5,15 @@ import { atomicWrite, bounded, uniqueName, type TaskRecord } from "./store.ts";
 import { accessMode, validateLoadout, type AccessMode, type Loadout } from "./loadout.ts";
 import { taskPrompt, type AgentMessage, type ContextMode } from "./context.ts";
 import { TaskManager } from "./tasks.ts";
+import { validateRolePlan, rolePlanDigest, type RolePlan } from "./role-loadout.ts";
 import { initialize, prepare, capture, validate, groupAlive, retain, remove, type Isolation, type Worktree } from "./workspaces.ts";
 
-export interface StepDefinition { id: string; task: string; access: AccessMode; dependsOn: string[] }
+export interface StepDefinition {
+  id: string; task: string; access?: AccessMode; dependsOn: string[];
+  role?: string; model?: string; context?: ContextMode; contextText?: string; dependencyReports?: "include" | "omit";
+}
 export interface WorkflowStep extends StepDefinition {
+  access: AccessMode; rolePlan?: RolePlan; snapshot?: AgentMessage[];
   state: "pending" | "running" | "completed" | "failed" | "cancelled";
   taskId?: string; error?: string; worktree?: Worktree; freshTask?: boolean; attemptId?: string;
 }
@@ -16,9 +21,11 @@ export interface WorkflowInput {
   name?: string; context: ContextMode; contextText?: string; snapshot?: AgentMessage[];
   parentSession?: string; loadout: Loadout; maxParallel?: number; steps: StepDefinition[];
   workspace?: "shared" | "isolated"; validationCommand?: string;
+  /** Already resolved by the caller; never look up the role catalog while scheduling. */
+  rolePlans?: Record<string, RolePlan>;
 }
-export interface WorkflowRecord extends Omit<WorkflowInput, "name" | "steps" | "maxParallel"> {
-  version: 1; id: string; name: string; maxParallel: number; steps: WorkflowStep[];
+export interface WorkflowRecord extends Omit<WorkflowInput, "name" | "steps" | "maxParallel" | "rolePlans"> {
+  version: 1 | 2; id: string; name: string; maxParallel: number; steps: WorkflowStep[];
   state: "running" | "paused" | "completed" | "cancelled";
   createdAt: number; updatedAt: number; error?: string;
   isolation?: Isolation; integration?: Worktree; validated?: boolean; validationPid?: number;
@@ -30,7 +37,12 @@ export function validateSteps(steps: StepDefinition[]): void {
   for (const s of steps) {
     if (!s || !/^[a-zA-Z0-9_-]{1,64}$/.test(s.id) || byId.has(s.id)) throw new Error("Step IDs must be unique, 1–64 letters/digits/_/-");
     if (typeof s.task !== "string" || !s.task.trim()) throw new Error(`Missing task for step ${s.id}`);
-    accessMode(s.access);
+    if (s.role !== undefined && (typeof s.role !== "string" || !/^[a-z0-9][a-z0-9_-]{0,63}$/.test(s.role))) throw new Error(`Invalid role for step ${s.id}`);
+    if (s.access !== undefined || s.role === undefined) accessMode(s.access);
+    if (s.model !== undefined && (typeof s.model !== "string" || !/^[^/\s]+\/[^\s]+$/.test(s.model))) throw new Error(`Step ${s.id}: use a canonical provider/model ID`);
+    if (s.context !== undefined && !["none", "partial", "full"].includes(s.context)) throw new Error(`Invalid context for step ${s.id}`);
+    if (s.contextText !== undefined && typeof s.contextText !== "string") throw new Error(`Invalid contextText for step ${s.id}`);
+    if (s.dependencyReports !== undefined && !["include", "omit"].includes(s.dependencyReports)) throw new Error(`Invalid dependencyReports for step ${s.id}`);
     if (!Array.isArray(s.dependsOn) || new Set(s.dependsOn).size !== s.dependsOn.length) throw new Error(`Invalid dependencies: ${s.id}`);
     byId.set(s.id, s);
   }
@@ -43,6 +55,29 @@ export function validateSteps(steps: StepDefinition[]): void {
     visiting.add(id); step.dependsOn.forEach(visit); visiting.delete(id); done.add(id);
   };
   for (const id of byId.keys()) visit(id);
+}
+const hasStepConfig = (s: StepDefinition) => [s.role, s.model, s.context, s.contextText, s.dependencyReports].some(v => v !== undefined);
+function checkPlans(steps: StepDefinition[], plans?: Record<string, RolePlan>): void {
+  for (const id of Object.keys(plans ?? {})) if (!steps.some(s => s.id === id && s.role)) throw new Error(`Unexpected role plan for step ${id}`);
+}
+function freezeStep(s: StepDefinition, input: Pick<WorkflowInput, "loadout" | "context" | "contextText" | "snapshot">, plan?: RolePlan): WorkflowStep {
+  if (s.role && !plan) throw new Error(`Missing role plan for step ${s.id}`);
+  if (plan) {
+    validateRolePlan(plan, { resources: false });
+    if (s.role !== plan.roleId || s.access !== undefined && s.access !== plan.access || s.model !== undefined && s.model !== plan.model ||
+        s.context !== undefined && s.context !== plan.context || plan.cwd !== input.loadout.cwd) throw new Error(`Role plan mismatch for step ${s.id}`);
+  }
+  const access = accessMode(plan?.access ?? s.access), context = plan?.context ?? s.context ?? input.context;
+  const model = plan?.model ?? s.model ?? input.loadout.model;
+  if (!/^[^/\s]+\/[^\s]+$/.test(model)) throw new Error(`Step ${s.id}: use a canonical provider/model ID`);
+  if (s.contextText !== undefined && context !== "partial") throw new Error(`Step ${s.id}: contextText is only supported in partial mode`);
+  const contextText = context === "partial" ? s.contextText ?? input.contextText : undefined;
+  taskPrompt(s.task, access, context, contextText);
+  if (context === "full" && !Array.isArray(input.snapshot)) throw new Error(`Step ${s.id}: full context requires an explicit frozen parent snapshot`);
+  return { ...structuredClone(s), access, model, context, ...(contextText !== undefined ? { contextText } : {}),
+    dependencyReports: s.dependencyReports ?? (s.role && context === "none" ? "omit" : "include"),
+    ...(context === "full" ? { snapshot: structuredClone(input.snapshot ?? []) } : {}),
+    ...(plan ? { rolePlan: structuredClone(plan) } : {}), state: "pending" };
 }
 /** Scheduling only. TaskManager remains the single owner of processes, sessions and cancellation. */
 export class WorkflowManager {
@@ -61,9 +96,19 @@ export class WorkflowManager {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     for (const file of readdirSync(dir).filter(f => /^[a-f0-9-]{36}\.json$/.test(f))) {
       const r = JSON.parse(readFileSync(join(dir, file), "utf8")) as WorkflowRecord;
-      if (r.version !== 1 || `${r.id}.json` !== file || !["running", "paused", "completed", "cancelled"].includes(r.state)) throw new Error(`Invalid workflow record: ${file}`);
+      if (![1, 2].includes(r.version) || `${r.id}.json` !== file || !["running", "paused", "completed", "cancelled"].includes(r.state)) throw new Error(`Invalid workflow record: ${file}`);
       validateSteps(r.steps); validateLoadout(r.loadout, { resources: false });
-      taskPrompt("workflow", "full", r.context, r.contextText);
+      if (r.version === 1) {
+        if (r.steps.some(s => hasStepConfig(s) || s.rolePlan)) throw new Error(`Invalid legacy workflow configuration: ${file}`);
+        taskPrompt("workflow", "full", r.context, r.contextText);
+      } else for (const s of r.steps) {
+        accessMode(s.access);
+        if (s.role && !s.rolePlan || !s.role && s.rolePlan) throw new Error(`Missing/mismatched role plan for step ${s.id}`);
+        // Access can change on explicit retry; the original authorization plan does not.
+        const frozen = freezeStep({ ...s, access: s.rolePlan?.access ?? s.access }, { ...r, snapshot: s.snapshot }, s.rolePlan);
+        if (frozen.model !== s.model || frozen.context !== s.context || frozen.contextText !== s.contextText || frozen.dependencyReports !== s.dependencyReports ||
+            s.context === "full" && !Array.isArray(s.snapshot) || s.context !== "full" && s.snapshot !== undefined) throw new Error(`Invalid frozen step configuration: ${s.id}`);
+      }
       if (!Number.isInteger(r.maxParallel) || r.maxParallel < 1 || r.maxParallel > 16 ||
           r.steps.some(s => !["pending", "running", "completed", "failed", "cancelled"].includes(s.state))) throw new Error(`Invalid workflow state: ${file}`);
       // Never re-launch a persisted running step. Reconcile task tags even if the
@@ -102,15 +147,20 @@ export class WorkflowManager {
   private emit(r: WorkflowRecord): void { if (!this.closed) this.notify?.(r); }
   private open(): void { if (this.closed) throw new Error("Workflow owner is shutting down"); }
   launch(input: WorkflowInput): WorkflowRecord {
-    this.open(); validateSteps(input.steps); validateLoadout(input.loadout);
-    taskPrompt("workflow", "full", input.context, input.contextText);
+    this.open(); validateSteps(input.steps); validateLoadout(input.loadout, { resources: input.steps.some(s => !s.role) });
+    checkPlans(input.steps, input.rolePlans);
+    const version = input.steps.some(hasStepConfig) || Object.keys(input.rolePlans ?? {}).length ? 2 : 1;
+    if (version === 1) taskPrompt("workflow", "full", input.context, input.contextText);
+    else if (!["none", "partial", "full"].includes(input.context)) throw new Error("Invalid workflow context mode");
+    const steps = input.steps.map(s => version === 2 ? freezeStep(s, input, input.rolePlans?.[s.id]) : { ...structuredClone(s), access: accessMode(s.access), state: "pending" as const });
     if (input.workspace !== undefined && !["shared", "isolated"].includes(input.workspace)) throw new Error("Invalid workspace mode");
     if (input.workspace === "isolated" && !input.validationCommand?.trim()) throw new Error("Isolated workflows require validationCommand");
     const maxParallel = input.maxParallel ?? 3;
     if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > 16) throw new Error("maxParallel must be 1–16");
-    const r: WorkflowRecord = { ...structuredClone(input), version: 1, id: randomUUID(),
+    const { rolePlans: _plans, snapshot, ...defaults } = structuredClone(input);
+    const r: WorkflowRecord = { ...defaults, ...(version === 1 ? { snapshot } : {}), version, id: randomUUID(),
       name: uniqueName(input.name ?? "workflow", [...this.records.values()].map(r => r.name)),
-      maxParallel, state: "running", steps: input.steps.map(s => ({ ...structuredClone(s), state: "pending" })),
+      maxParallel, state: "running", steps,
       createdAt: Date.now(), updatedAt: Date.now() };
     this.save(r); this.records.set(r.id, r); this.schedule(); return r;
   }
@@ -180,7 +230,7 @@ export class WorkflowManager {
   }
   private async dispatch(r: WorkflowRecord): Promise<void> {
     if (this.integrationRuns.has(r.id) || this.cleaning.has(r.id)) return;
-    validateLoadout(r.loadout);
+    if (r.steps.some(s => !s.role)) validateLoadout(r.loadout);
     if (this.unsafe(r)) throw new Error("Unconfirmed workflow child/validation shutdown; inspect orphan processes before scheduling");
     if (r.workspace === "isolated") {
       if (!r.isolation) { r.isolation = await initialize(r.loadout.cwd, join(this.dir, `${r.id}-worktrees`)); this.save(r); }
@@ -226,14 +276,15 @@ export class WorkflowManager {
       }
       s.attemptId ??= randomUUID();
       s.state = "running"; this.save(r);
-      const dependencies = s.dependsOn.map(id => {
+      const dependencies = (s.dependencyReports === "omit" ? [] : s.dependsOn).map(id => {
         const upstream = r.steps.find(d => d.id === id)!;
         const task = this.tasks.get(upstream.taskId!);
         return `Step ${id} (result is a worker report, not independent acceptance):\n${bounded(task.output, 8000)}\nSession: ${task.sessionFile}`;
       }).join("\n\n");
       const launch = this.tasks.launch({ name: `${r.name.slice(0, 35)}-${s.id.slice(0, 30)}`, task: `${s.task}${dependencies ? `\n\nDirect dependency results (reference data):\n${dependencies}` : ""}`,
-        access: s.access, context: r.context, contextText: r.contextText, snapshot: r.snapshot,
-        loadout, parentSession: r.parentSession, workflow: { id: r.id, stepId: s.id, attemptId: s.attemptId } });
+        access: s.access, context: s.context ?? r.context, contextText: r.version === 2 ? s.contextText : r.contextText, snapshot: r.version === 2 ? s.snapshot : r.snapshot,
+        ...(s.rolePlan ? { rolePlan: { ...structuredClone(s.rolePlan), cwd: loadout.cwd } } : { loadout: { ...structuredClone(loadout), model: s.model ?? loadout.model } }),
+        parentSession: r.parentSession, workflow: { id: r.id, stepId: s.id, attemptId: s.attemptId } });
       const task = this.findTask(r, s); if (task) { s.taskId = task.id; s.freshTask = false; }
       // Attach a rejection handler before persisting: disk failure must not leave an unobserved launch.
       void launch.then(t => { if (t.workflow?.attemptId === s.attemptId) { s.taskId = t.id; s.freshTask = false; } }).catch(e => {
@@ -254,10 +305,10 @@ export class WorkflowManager {
     if (this.unsafe(r)) throw new Error("Unconfirmed child shutdown; cannot resume");
     if (r.steps.some(s => s.state === "failed" || s.state === "cancelled" ||
         ["failed", "cancelled"].includes(this.findTask(r, s)?.state ?? ""))) throw new Error("Explicitly retry failed/cancelled steps before resume");
-    validateLoadout(r.loadout);
+    if (r.steps.some(s => !s.role)) validateLoadout(r.loadout);
     r.state = "running"; r.error = undefined; this.save(r); this.schedule();
   }
-  update(id: string, updates: StepDefinition[]): void {
+  update(id: string, updates: StepDefinition[], rolePlans?: Record<string, RolePlan>, snapshot?: AgentMessage[]): void {
     this.open(); const r = this.get(id);
     if (r.state !== "paused") throw new Error("Pause the workflow before updating pending steps");
     if (this.integrationRuns.has(r.id) || this.preparing.has(r.id)) throw new Error("Wait for workspace preparation/validation before updating steps");
@@ -267,9 +318,21 @@ export class WorkflowManager {
       const old = r.steps.find(s => s.id === update.id);
       if (old && (old.state !== "pending" || old.taskId || old.worktree)) throw new Error(`Step ${old.id} already started; cannot edit`);
     }
-    const next = r.steps.map(s => { const u = updates.find(u => u.id === s.id); return u ? { ...structuredClone(u), state: "pending" as const } : s; });
-    for (const s of updates) if (!next.some(n => n.id === s.id)) next.push({ ...structuredClone(s), state: "pending" });
-    r.steps = next; r.validated = false; this.retireIntegration(r); this.save(r);
+    checkPlans(updates, rolePlans);
+    const version = r.version === 2 || updates.some(hasStepConfig) || Object.keys(rolePlans ?? {}).length ? 2 : 1;
+    const fallback = r.snapshot ?? r.steps.find(s => s.context === "full")?.snapshot ?? (r.version === 1 && r.context === "full" ? [] : undefined);
+    const replacements = new Map(updates.map(s => {
+      if (version === 1) return [s.id, { ...structuredClone(s), access: accessMode(s.access), state: "pending" as const }] as const;
+      const frozen = freezeStep(s, { ...r, snapshot: snapshot ?? r.steps.find(old => old.id === s.id)?.snapshot ?? fallback }, rolePlans?.[s.id]);
+      if (frozen.context === "full" && snapshot === undefined && r.steps.find(old => old.id === s.id)?.snapshot === undefined && fallback === undefined) throw new Error(`Step ${s.id}: full context update requires a parent snapshot`);
+      return [s.id, frozen] as const;
+    }));
+    const next = r.steps.map(s => replacements.get(s.id) ?? (r.version === 1 && version === 2
+      ? { ...freezeStep(s, { ...r, snapshot: r.snapshot ?? (r.context === "full" ? [] : undefined) }), state: s.state } : s));
+    for (const s of replacements.values()) if (!next.some(n => n.id === s.id)) next.push(s);
+    r.version = version; r.steps = next;
+    if (version === 2) delete r.snapshot;
+    r.validated = false; this.retireIntegration(r); this.save(r);
   }
   async retry(id: string, stepId: string, message: string, access?: AccessMode): Promise<void> {
     this.open(); const r = this.get(id); this.reconcile(r);
@@ -283,7 +346,7 @@ export class WorkflowManager {
     for (let i = 0; i < r.steps.length; i++) for (const d of r.steps) if (d.dependsOn.some(id => descendants.has(id))) descendants.add(d.id);
     if (r.steps.some(d => d.id !== s.id && descendants.has(d.id) && (d.state !== "pending" || !!d.worktree))) throw new Error("A dependent step already started; cannot silently invalidate its input");
     const selected = accessMode(access ?? s.access);
-    validateLoadout(r.loadout);
+    if (!s.role) validateLoadout(r.loadout);
     if (!this.tasks.hasCapacity()) throw new Error("Global subagent concurrency limit reached");
     const task = this.findTask(r, s);
     if (!task) {
@@ -411,5 +474,5 @@ export class WorkflowManager {
   }
 }
 export function workflowSummary(r: WorkflowRecord): string {
-  return `${r.name} [${r.id}] ${r.state} workspace=${r.workspace ?? "shared"}\n${r.integration ? `Integration: ${r.integration.path} revision=${r.integration.revisionRef ?? r.integration.output ?? "pending"} removed=${!!r.integration.removed} validated=${!!r.validated}${r.validationPid ? ` validationPid=${r.validationPid}` : ""}\n` : ""}${r.error ?? ""}${r.cleanupError ? `\nCleanup blocked: ${r.cleanupError}` : ""}\n${r.steps.map(s => `${s.id}: ${s.state} (${s.access}) dependsOn=[${s.dependsOn.join(", ")}]${s.taskId ? ` task=${s.taskId}` : ""}${s.worktree ? ` worktree=${s.worktree.path} removed=${!!s.worktree.removed}${s.worktree.revisionRef ? ` ref=${s.worktree.revisionRef}` : ""}` : ""}${s.error ? ` — ${s.error}` : ""}`).join("\n")}`;
+  return `${r.name} [${r.id}] ${r.state} workspace=${r.workspace ?? "shared"}\n${r.integration ? `Integration: ${r.integration.path} revision=${r.integration.revisionRef ?? r.integration.output ?? "pending"} removed=${!!r.integration.removed} validated=${!!r.validated}${r.validationPid ? ` validationPid=${r.validationPid}` : ""}\n` : ""}${r.error ?? ""}${r.cleanupError ? `\nCleanup blocked: ${r.cleanupError}` : ""}\n${r.steps.map(s => `${s.id}: ${s.state} (${s.access})${s.rolePlan ? ` role=${s.role} config=${rolePlanDigest(s.rolePlan).slice(0, 12)}` : ""}${r.version === 2 ? ` model=${s.model} context=${s.context} dependencyReports=${s.dependencyReports}` : ""} dependsOn=[${s.dependsOn.join(", ")}]${s.taskId ? ` task=${s.taskId}` : ""}${s.worktree ? ` worktree=${s.worktree.path} removed=${!!s.worktree.removed}${s.worktree.revisionRef ? ` ref=${s.worktree.revisionRef}` : ""}` : ""}${s.error ? ` — ${s.error}` : ""}`).join("\n")}`;
 }

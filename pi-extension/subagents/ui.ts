@@ -4,6 +4,7 @@ import { Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/p
 import type { TaskManager } from "./tasks.ts";
 import type { TaskRecord } from "./store.ts";
 import { taskDashboard, type DashboardPane, type TaskAction } from "./dashboard.ts";
+import { effectiveRole, type RolePlan, type RoleRun, type RoleSnapshot, type RoleToolSnapshot } from "./role-loadout.ts";
 
 export function clean(text: string): string {
   return stripTerminalSequences(text).replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
@@ -14,8 +15,67 @@ function elapsed(r: TaskRecord, now: number): string {
   const seconds = Math.max(0, Math.floor(((r.state === "running" || r.state === "waiting" ? now : r.updatedAt) - r.startedAt) / 1000));
   return seconds < 60 ? `${seconds}s` : `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
+const rolePlan = (r: TaskRecord): RolePlan | undefined => r.version === 3 ? r.rolePlan : undefined;
+const preflight = (run: RoleRun | undefined): string => run?.snapshot?.preflightComplete ? "complete"
+  : run?.outcome === "cancelled" ? "incomplete" : run?.error || run?.outcome === "failed" ? "failed" : "pending";
+function roleSummary(r: TaskRecord): string {
+  const plan = rolePlan(r), run = r.roleRuns?.at(-1);
+  return plan ? `Role: ${plan.roleId} · preflight ${preflight(run)} · ${run?.status ?? "unknown"}` : "";
+}
+function capabilitySelection(selection: Pick<RolePlan, "builtinTools" | "extraTools" | "mcp" | "skills">): string[] {
+  return [
+    `Builtin: ${selection.builtinTools.join(", ") || "none"}`,
+    ...selection.extraTools.map(t => `Local: ${t.tools.join(", ")} · ${t.entry} · sha256 ${t.hash}`),
+    ...selection.mcp.map(m => `MCP: ${m.server} · raw tools: ${m.tools.join(", ")}`),
+    `Skills: ${selection.skills.map(s => `${s.name} (${s.filePath}${s.disableModelInvocation ? "; model invocation disabled" : ""})`).join(", ") || "none"}`,
+  ];
+}
+function toolProvenance(t: RoleSnapshot["reservedBridge"] & Partial<RoleToolSnapshot>, kind: string): string[] {
+  return [
+    `- ${t.name} · ${kind} · ${t.exposure ?? "unknown exposure"}`,
+    `  SourceInfo: ${JSON.stringify(t.sourceInfo, (_key, value: unknown) => typeof value === "string" ? inline(value) : value)}`,
+    ...(t.entry ? [`  Local entry: ${t.entry} · sha256 ${t.hash}`] : []),
+    ...(t.server ? [`  MCP server: ${t.server} · raw tool: ${t.remoteName} · config sha256 ${t.configHash} · definition sha256 ${t.definitionHash}`] : []),
+  ];
+}
+function actualInventory(snapshot: RoleSnapshot): string[] {
+  return [
+    `Pi: ${snapshot.piVersion} · Model: ${snapshot.model} · Thinking: ${snapshot.thinking}`,
+    ...snapshot.tools.flatMap(t => toolProvenance(t, t.semanticKind)),
+    ...toolProvenance(snapshot.reservedBridge, "runtime bridge"),
+    `Actual skills: ${snapshot.skills.map(s => `${s.name} (${s.filePath}${s.disableModelInvocation ? "; model invocation disabled" : ""})`).join(", ") || "none"}`,
+  ];
+}
+function runStatus(run: RoleRun | undefined): string[] {
+  const submission = run?.status === "submitted" ? "receipt acknowledged" : run?.status === "submitting" ? "receipt unknown" : "not started";
+  return [
+    `Preflight: ${preflight(run)} · Run phase: ${run?.status ?? "unknown"}`,
+    `Model submission: ${submission}`,
+    `Run outcome: ${run?.outcome ?? "unknown"} · Cleanup: ${run?.cleanup ?? "unknown"}`,
+    ...(run?.error ? [`Run error: ${run.error}`] : []),
+  ];
+}
+/** All role content comes from the persisted plan/runs, never current files or services. */
+function roleDetails(r: TaskRecord): string[] {
+  const plan = rolePlan(r);
+  if (!plan) return [];
+  const run = r.roleRuns?.at(-1), access = run?.access ?? r.access ?? plan.access;
+  const history = r.roleRuns?.slice(0, -1) ?? [];
+  return [
+    `\n── Role: ${plan.roleId} ──`,
+    `Config: ${plan.manifestPath} · sha256 ${plan.manifestHash} · schema ${plan.schemaVersion} · prompt v${plan.promptVersion}`,
+    "\nDeclared / available capabilities (frozen plan)", ...capabilitySelection(plan),
+    `\nEffective capabilities · run ${r.run} · ${access}`, ...runStatus(run),
+    ...(run?.snapshot ? ["Actual inventory: verified snapshot", ...actualInventory(run.snapshot)]
+      : ["Effective selection (unverified)", ...capabilitySelection(effectiveRole(plan, access)), "Runtime bridge: ask_question (unverified)", "Actual inventory: not recorded for this run"]),
+    ...(history.length ? ["\nRun history (saved; not current effective capabilities)", ...history.flatMap(previous => [
+      `Run ${previous.binding.run} · ${previous.access} · ${previous.status} · ${previous.outcome ?? "unknown"} · Cleanup: ${previous.cleanup ?? "unknown"}`,
+      ...runStatus(previous), ...(previous.snapshot ? actualInventory(previous.snapshot) : ["Actual inventory: not recorded for this run"]),
+    ])] : []),
+  ];
+}
 export function taskSummary(r: TaskRecord, now = Date.now()): string {
-  return inline(`${glyph(r.state)} ${r.name} [${r.id}] · ${r.state} · ${elapsed(r, now)} · ${r.activity}`);
+  return inline(`${glyph(r.state)} ${r.name} [${r.id}] · ${rolePlan(r) ? `${roleSummary(r)} · ` : ""}${r.state} · ${elapsed(r, now)} · ${r.activity}`);
 }
 const activeRecords = (records: TaskRecord[]): TaskRecord[] => records.filter(r => r.state === "running" || r.state === "waiting");
 const recoveryStatus = (r: TaskRecord): string => r.recovery?.phase === "cleaning"
@@ -63,7 +123,7 @@ export class TaskWidget {
       ...unsafe.map(r => `! ${r.name} · shutdown unconfirmed — ${recoveryStatus(r)}`),
       ...pending.map(r => `? ${r.name} · ${r.questions.filter(q => !q.responseSent).map(q => q.title).join("; ")}`),
     ];
-    const previews = active.slice(0, 3).map(r => `${glyph(r.state)} ${r.name} · ${elapsed(r, now)} · ${r.activity}`);
+    const previews = active.slice(0, 3).map(r => `${glyph(r.state)} ${r.name} · ${rolePlan(r) ? `${roleSummary(r)} · ` : ""}${elapsed(r, now)} · ${r.activity}`);
     return [
       `Subagents ─ ${counts.join(" · ")} · /subagents`,
       ...previews.map(inline),
@@ -95,7 +155,7 @@ export function widget(manager: TaskManager, ctx: ExtensionContext, display: Tas
           const record = previews[index - 1];
           const content = record
             ? theme.fg(stateColor(record.state), glyph(record.state)) + " " + theme.fg("text", inline(record.name))
-              + theme.fg("muted", ` · ${elapsed(record, now)} · ${inline(record.activity)}`)
+              + theme.fg("muted", ` · ${rolePlan(record) ? `${inline(roleSummary(record))} · ` : ""}${elapsed(record, now)} · ${inline(record.activity)}`)
             : theme.fg(line.startsWith("!") || line.startsWith("?") ? "warning" : "muted", line);
           return truncateToWidth(theme.fg("muted", "│ ") + content, width);
         });
@@ -115,6 +175,7 @@ export function detail(r: TaskRecord, live = false): string {
     ...(r.execution ? [`Execution: ${r.execution.boundary.unit} · Cleanup: ${r.execution.cleanup}`] : []),
     ...(r.workflow ? [`Workflow: ${r.workflow.id}, step ${r.workflow.stepId}`] : []),
     `Cwd: ${r.loadout.cwd}`, `Session: ${r.sessionFile}`,
+    ...roleDetails(r),
     "\n── Task · Parent prompt ──", r.task,
     ...(r.error ? ["\n── Error ──", r.error] : []),
     "\n── Questions ──",
@@ -125,7 +186,7 @@ export function detail(r: TaskRecord, live = false): string {
   ].join("\n"));
 }
 export function dashboardSummary(r: TaskRecord): string {
-  return inline(`${glyph(r.state)} ${r.name} · ${r.state}`);
+  return inline(`${glyph(r.state)} ${r.name} · ${rolePlan(r) ? `${roleSummary(r)} · ` : ""}${r.state}`);
 }
 function readTrace(record: TaskRecord): string {
   const heading = [
@@ -187,6 +248,7 @@ export function dashboardDetail(r: TaskRecord, pane: DashboardPane, trace = read
     `Shutdown: ${shutdown}`,
     ...(r.recovery?.error ? [`Cleanup: ${r.recovery.error}`] : []),
     ...(r.workflow ? [`Workflow step: ${r.workflow.stepId}`] : []),
+    ...roleDetails(r),
     `\nNow: ${inline(r.activity)}`,
     ...(r.error ? ["\nError", r.error] : []),
     "\nQuestions",

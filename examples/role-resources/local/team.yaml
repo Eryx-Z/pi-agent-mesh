@@ -1,0 +1,7 @@
+schema_version: 1
+enabled: true
+main_role: pm
+roles:
+  pm: builtin:pm
+  greeter: ./role.yaml
+mcp_servers: {}

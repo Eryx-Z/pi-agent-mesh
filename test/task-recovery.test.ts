@@ -180,6 +180,9 @@ test('capacity-waiter cleanup never exposes an unguarded continuation or removes
     await until(() => t.prompts.some(prompt => prompt.includes('Recover the interrupted task')));
     const waiting = records.find(record => record.run === 1)!;
     const running = records.find(record => record.run === 2)!;
+    // The request observer records a prompt before its RPC receipt settles.
+    // Exercise supplementary messaging only after the public acceptance state.
+    await until(() => running.log.some(line => line.includes('Initial task accepted by RPC')));
     let reentrant: Promise<TaskRecord> | undefined;
     const unsubscribe = manager.subscribe(() => {
       // A UI/workflow subscriber is allowed to synchronously invoke public controls.

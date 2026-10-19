@@ -7,7 +7,7 @@ import { isDeepStrictEqual } from "node:util";
 import { Ajv } from "ajv";
 import { Ajv2020 } from "ajv/dist/2020.js";
 import type { AccessMode } from "./loadout.ts";
-import { effectiveRole, roleMcpConfigHash, roleMcpDefinitionHash, ROLE_CHILD_EXTENSION, type RolePlan, type RoleMcpSource } from "./role-loadout.ts";
+import { effectiveRole, roleMcpConfigHash, roleMcpDefinitionHash, ROLE_CHILD_EXTENSION, ROLE_MAIN_EXTENSION, type RolePlan, type RoleMcpSource } from "./role-loadout.ts";
 export type { RoleMcpSource } from "./role-loadout.ts";
 
 export interface RoleMcpAdapter {
@@ -54,7 +54,8 @@ function resolveCredential(value: string, label: string, secrets: Set<string>): 
 }
 
 /** Loaded only by role children. Read-only/empty selections do not load the native MCP runtime. */
-export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: AccessMode): Promise<RoleMcpAdapter> {
+export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: AccessMode, wrapper = ROLE_CHILD_EXTENSION): Promise<RoleMcpAdapter> {
+  if (![ROLE_CHILD_EXTENSION, ROLE_MAIN_EXTENSION].includes(wrapper)) throw new Error("Invalid role MCP wrapper identity");
   const selected = effectiveRole(plan, access).mcp;
   const required = new Map<string, Set<string>>();
   for (const m of selected) {
@@ -104,7 +105,7 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
       const definition = definitions.get(name)!.definition;
       const tool = actual.find(t => t.name === name);
       if (!tool || !isDeepStrictEqual(metadata(tool), metadata(definition)) ||
-          tool.sourceInfo?.path !== ROLE_CHILD_EXTENSION || (ready && !baseline.has(name)) ||
+          tool.sourceInfo?.path !== wrapper || (ready && !baseline.has(name)) ||
           (baseline.has(name) && !isDeepStrictEqual(baseline.get(name), copy({ metadata: metadata(tool), sourceInfo: tool.sourceInfo })))) {
         throw new Error(`Role ${plan.roleId} MCP ${source.server}: selected tool definition/provenance changed (${rawName})`);
       }
@@ -159,7 +160,7 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
     const common = { ...(config.timeout !== undefined ? { timeout: config.timeout } : {}),
       ...(config.description !== undefined ? { description: config.description } : {}),
       exposure: "hidden" as const, toolExposure: Object.fromEntries([...names].map(n => [n, "direct" as const])) };
-    entries.push({ name: server, source: ROLE_CHILD_EXTENSION, config: http ? {
+    entries.push({ name: server, source: wrapper, config: http ? {
       ...common, type: "http", url: config.url!, headers: resolved,
     } : { ...common, type: "stdio", command: config.command!, args: config.args ? [...config.args] : undefined,
       cwd: config.cwd ?? plan.cwd, env: resolved } });
@@ -192,7 +193,10 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
         if (callId !== undefined) {
           // Native renewal retries do not pass through Pi's tool_call hook again.
           // Let pending registrations settle, but never forward a cancelled retry.
-          if (state.refreshing && !state.inventoryFailed) await new Promise<void>(resolve => setImmediate(resolve));
+          // Always observe one registration/cancellation turn: under load the
+          // inventory-settled callback may have cleared refreshing before the
+          // native renewal promise resumes, while its abort is still queued.
+          if (!state.inventoryFailed) await new Promise<void>(resolve => setImmediate(resolve));
           if (closed || cancelledSends.has(callId)) throw new Error("MCP tool request cancelled before transport submission");
           if (!ready || connections.get(entry.name) !== state) throw new Error(`Role ${plan.roleId} MCP ${entry.name}: tool call before verified connection`);
           verify();

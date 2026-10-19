@@ -152,7 +152,7 @@ export class TaskManager {
     if (!input.task.trim()) throw new Error("Task is required");
     const prompt = taskPrompt(input.task, input.access, input.context, input.contextText);
     const plan = input.rolePlan ? structuredClone(validateRolePlan(input.rolePlan, { access: input.access })) : undefined;
-    if (plan && (plan.context !== input.context || plan.access !== input.access)) throw new Error("Role plan/input context or initial access mismatch");
+    if (plan && (plan.context !== input.context || !input.workflow && plan.access !== input.access)) throw new Error("Role plan/input context or initial access mismatch");
     if (plan && input.context !== "partial" && input.contextText !== undefined) throw new Error("Role contextText is only supported for partial context");
     if (!plan) validateLoadout(input.loadout);
     if (input.context === "full" && plan && !Array.isArray(input.snapshot)) throw new Error("Role full context requires an explicit frozen parent snapshot");

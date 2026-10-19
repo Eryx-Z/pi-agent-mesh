@@ -1,0 +1,12 @@
+schema_version: 1
+id: directory_reader
+description: List this example directory through an explicitly selected stdio MCP tool
+system_prompt: ./system.md
+builtin_tools: [read]
+mcp:
+  - server: filesystem
+    tools: [list_directory]
+defaults:
+  access: full
+  context: none
+  model: inherit

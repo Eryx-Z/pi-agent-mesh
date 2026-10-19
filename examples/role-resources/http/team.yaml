@@ -1,0 +1,14 @@
+schema_version: 1
+enabled: true
+main_role: pm
+roles:
+  pm: builtin:pm
+  document_reader: ./role.yaml
+mcp_servers:
+  documents:
+    type: http
+    url: https://mcp.example.invalid/mcp
+    headers:
+      Authorization: "Bearer ${ROLE_RESOURCES_HTTP_TOKEN}"
+    timeout: 10000
+    description: Placeholder only; replace with a trusted Streamable HTTP MCP endpoint

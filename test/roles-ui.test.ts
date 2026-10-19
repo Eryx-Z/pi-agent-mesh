@@ -50,6 +50,24 @@ test("catalog UI pins startup directory and explicit selection before lazy first
   } finally { if (before === undefined) delete process.env.PI_AGENT_MESH_CONFIG; else process.env.PI_AGENT_MESH_CONFIG = before; }
 });
 
+test("each session_start rereads the selected catalog while retaining process-start path selection", async t => {
+  const dir = mkdtempSync(join(tmpdir(), "roles-ui-session-")); t.after(() => rmSync(dir, { recursive: true, force: true }));
+  mkdirSync(join(dir, ".pi"));
+  writeFileSync(join(dir, ".pi/agent-mesh.yaml"), "schema_version: 1\nenabled: true\nmain_role: pm\nroles: {pm: ./pm.yaml}\n");
+  writeFileSync(join(dir, ".pi/pm.yaml"), "schema_version: 1\nid: pm\ndescription: PM\nsystem_prompt: ./pm.md\nbuiltin_tools: []\ndefaults: {access: read-only}\n");
+  const body = join(dir, ".pi/pm.md"); writeFileSync(body, "ORIGINAL_BODY");
+  const old = process.env.PI_AGENT_MESH_CONFIG; process.env.PI_AGENT_MESH_CONFIG = "";
+  try {
+    const h = harness(), access = registerRoles(h.api)!;
+    await h.handlers.get("session_start")!({}, h.context(dir));
+    assert.equal((await access.current(h.context(dir))).current!.roles[0].systemPrompt, "ORIGINAL_BODY");
+    writeFileSync(body, "CHANGED_BODY");
+    assert.equal((await access.current(h.context(dir))).current!.roles[0].systemPrompt, "ORIGINAL_BODY");
+    await h.handlers.get("session_start")!({}, h.context(dir));
+    assert.equal((await access.current(h.context(dir))).current!.roles[0].systemPrompt, "CHANGED_BODY");
+  } finally { if (old === undefined) delete process.env.PI_AGENT_MESH_CONFIG; else process.env.PI_AGENT_MESH_CONFIG = old; }
+});
+
 test("first invalid catalog never becomes a successful empty list and can recover by reload", async t => {
   const dir = mkdtempSync(join(tmpdir(), "roles-ui-invalid-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));

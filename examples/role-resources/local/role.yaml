@@ -1,0 +1,12 @@
+schema_version: 1
+id: greeter
+description: Demonstrate one explicitly selected local tool
+system_prompt: ./system.md
+builtin_tools: [read]
+extra_tools:
+  - entry: ./greeting.ts
+    tools: [greet]
+defaults:
+  access: full
+  context: none
+  model: inherit

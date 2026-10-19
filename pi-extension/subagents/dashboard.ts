@@ -140,9 +140,10 @@ export class TaskDashboard {
     const shortcuts = tabs;
     const scrolling = view?.follow ? "Following latest" : position;
     const focus = ` · Focus: ${this.state.detailFocus ? "Detail" : "Tasks"}`;
-    const title = record ? `${inline(record.name)} · ${record.state}` : "Subagents";
+    const role = record?.version === 3 && record.rolePlan;
+    const title = record ? role ? this.content.summary(record) : `${inline(record.name)} · ${record.state}` : "Subagents";
     const header = th.fg("accent", fit(title, Math.max(0, contentWidth - visibleWidth(focus)))) + th.fg("muted", focus);
-    const modelLine = th.fg("muted", `Model: ${model}`);
+    const modelLine = th.fg("muted", `Model: ${model}${role && record ? ` · Context: ${record.context} · Access: ${record.access}` : ""}`);
     const paneTitle = `${this.state.pane[0].toUpperCase()}${this.state.pane.slice(1)}`;
     if (!framed) {
       // Tiny terminals prioritize useful text and keyboard access over decoration.

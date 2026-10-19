@@ -3,7 +3,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { join, resolve } from "node:path";
 import { readFileSync } from "node:fs";
-import { nonempty, resolveLoadout } from "./loadout.ts";
+import { accessMode, nonempty, resolveLoadout } from "./loadout.ts";
 import { snapshotContext } from "./context.ts";
 import { TaskStore, bounded, toolHistory } from "./store.ts";
 import { TaskManager } from "./tasks.ts";
@@ -12,6 +12,10 @@ import { detail, resultRenderer, taskMenu, taskSummary, widget, TaskWidget } fro
 import type { AgentMessage } from "./context.ts";
 import { closeDashboards } from "./dashboard.ts";
 import { registerRoles } from "./roles-ui.ts";
+import { createTeamRuntime, installMainMcpRouter } from "./pm.ts";
+import { resolveRoleDispatch, selectedModel } from "./role-dispatch.ts";
+import type { RolePlan } from "./role-loadout.ts";
+import type { StepDefinition } from "./workflows.ts";
 
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
 const accessSchema = () => StringEnum(["read-only", "full"] as const);
@@ -20,14 +24,19 @@ const contextFields = {
   contextText: Type.Optional(Type.String({ description: "Selected parent context, required for partial mode (including when context is omitted); only supported in partial mode. Use context=none for an independent task." })),
   name: Type.Optional(Type.String()), model: Type.Optional(Type.String()), cwd: Type.Optional(Type.String()),
 };
+const roleField = Type.Optional(Type.String({ pattern: "^[a-z0-9][a-z0-9_-]{0,63}$" }));
 const stepSchema = Type.Object({
   id: Type.String({ minLength: 1, maxLength: 64, pattern: "^[a-zA-Z0-9_-]+$" }),
-  task: Type.String({ minLength: 1 }), access: accessSchema(),
+  task: Type.String({ minLength: 1 }), access: Type.Optional(accessSchema()), role: roleField,
+  model: Type.Optional(Type.String()), context: contextFields.context, contextText: contextFields.contextText,
+  dependencyReports: Type.Optional(StringEnum(["include", "omit"] as const)),
   dependsOn: Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true }),
 }, { additionalProperties: false });
-export default function subagentsExtension(pi: ExtensionAPI) {
+export default async function subagentsExtension(pi: ExtensionAPI) {
   if (process.env.PI_RPC_SUBAGENT_CHILD === "1") return;
-  registerRoles(pi);
+  const catalog = registerRoles(pi)!;
+  const team = createTeamRuntime(pi, catalog);
+  pi.on("input", (_event, ctx) => team.input(ctx));
   let manager: TaskManager | undefined;
   let workflows: WorkflowManager | undefined;
   let ctxForWidget: ExtensionContext | undefined;
@@ -35,7 +44,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   let promptOptions: { skills?: Skill[] } | undefined;
   // Later handlers may replace the skills array. Freeze the final inventory at dispatch,
   // not while the before_agent_start handler chain is still running.
-  pi.on("before_agent_start", event => { promptOptions = event.systemPromptOptions; });
+  pi.on("before_agent_start", async (event, ctx) => { await team.prepare(event, ctx); promptOptions = event.systemPromptOptions; });
   const snapshots = new Map<string, AgentMessage[]>();
   function current(): TaskManager {
     if (!manager) throw new Error("Subagents require an active persistent parent session");
@@ -58,11 +67,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     snapshots.delete(id); return value;
   }
   pi.on("session_start", async (_event, ctx) => {
+    const startup = team.start(ctx);
     closeDashboards();
     if (interval) clearInterval(interval);
     interval = undefined;
     ctx.ui.setWidget("rpc-subagents", undefined);
-    if (!ctx.sessionManager.getSessionFile()) return;
+    if (!ctx.sessionManager.getSessionFile()) { await startup; return; }
     const display = new TaskWidget();
     ctxForWidget = ctx;
     // Host imports are mapped by Pi's loader; native module resolution cannot locate them.
@@ -78,15 +88,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const content = kind === "question"
           ? `Subagent ${record.name} (${record.id}) needs an answer:\n${record.questions.filter(q => !q.responseSent).map(q => `${q.id}: ${q.title}`).join("\n")}\nUse subagent_control action=answer with id, questionId, message.`
           : `Subagent ${record.name} (${record.id}) ${record.state}.\n${record.error ?? ""}\n${record.recovery?.error ?? ""}\n${bounded(record.output)}\nSession: ${record.sessionFile}\nStopping is not acceptance: review its validation and shared-workspace changes.`;
-        pi.sendMessage({ customType: `rpc_subagent_${kind}`, content, display: true, details: { id: record.id, state: record.state } }, { deliverAs: "steer", triggerTurn: true });
+        team.notify({ customType: `rpc_subagent_${kind}`, content, display: true, details: { id: record.id, state: record.state } });
       },
     });
     workflows = new WorkflowManager(manager, join(dir, "workflows"), r => {
-      pi.sendMessage({ customType: "rpc_workflow_result", content: `${workflowSummary(r)}\nStep completion is not independent acceptance; inspect reports and validation.`, display: true, details: { id: r.id, state: r.state } }, { deliverAs: "steer", triggerTurn: true });
+      team.notify({ customType: "rpc_workflow_result", content: `${workflowSummary(r)}\nStep completion is not independent acceptance; inspect reports and validation.`, display: true, details: { id: r.id, state: r.state } });
     });
     manager.startRecovery();
     interval = setInterval(() => { if (manager && ctxForWidget) widget(manager, ctxForWidget, display); }, 500);
     widget(manager, ctx, display);
+    await startup;
   });
   pi.on("session_shutdown", async () => {
     closeDashboards();
@@ -96,28 +107,35 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const old = manager, oldFlows = workflows;
     old?.fenceRecovery();
     manager = undefined; workflows = undefined; ctxForWidget = undefined;
+    await team.stop();
     try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); }
   });
   pi.on("tool_call", (event, ctx) => {
-    if ((event.toolName === "subagent" || event.toolName === "workflow_run") && event.input?.context === "full") snapshots.set(event.toolCallId, snapshotContext(ctx.sessionManager));
+    if (event.toolName === "workflow_run" || event.toolName === "workflow_control" && event.input?.action === "update" || event.toolName === "subagent") snapshots.set(event.toolCallId, snapshotContext(ctx.sessionManager));
+    return team.toolCall(event.toolName, event.parentToolCallId);
   });
   pi.on("tool_execution_end", event => { snapshots.delete(event.toolCallId); });
   pi.registerTool({
     name: "subagent", label: "Subagent",
-    description: "Launch an asynchronous RPC subagent in the shared working directory. Required access: read-only (verified builtin read/grep/find/ls only, plus ask_question) or full (parent active nondelegation tools). Tool filtering is not a sandbox. Context: none, partial (default; requires contextText), full (frozen active branch). Results/questions arrive automatically. Use subagent_control for history, questions, follow-up and continuation.",
+    description: "Launch an asynchronous RPC subagent in the shared working directory. Optional role selects independently configured capabilities and defaults. Without role, access is required: read-only (verified builtin read/grep/find/ls only, plus ask_question) or full (parent active nondelegation tools). Tool filtering is not a sandbox. Context: none, partial (default; requires contextText), full (frozen active branch). Results/questions arrive automatically. Use subagent_control for history, questions, follow-up and continuation.",
     promptSnippet: "Delegate a task with explicit access and context",
     promptGuidelines: [
       "Coordinate parallel writers; standalone subagents share the working directory and have no write locks.",
       "After launch, do independent work or end the turn; results arrive automatically. Do not poll or invent completion.",
       "Worker reports are claims: inspect validation and changes before acceptance. Use read-only continuation to ask for explanations without granting write tools.",
     ],
-    parameters: Type.Object({ task: Type.String({ minLength: 1 }), access: accessSchema(), ...contextFields }, { additionalProperties: false }),
+    parameters: Type.Object({ task: Type.String({ minLength: 1 }), role: roleField, access: Type.Optional(accessSchema()), ...contextFields }, { additionalProperties: false }),
     async execute(id, params, signal, _update, ctx) {
-      signal?.throwIfAborted(); const m = current(); const mode = params.context ?? "partial";
-      const record = await m.launch({ name: params.name, task: params.task, access: params.access, context: mode, contextText: params.contextText,
-        loadout: loadout(ctx, params), snapshot: snapshot(id, mode, ctx), parentSession: ctx.sessionManager.getSessionFile() });
+      signal?.throwIfAborted(); const m = current();
+      const resolved = params.role !== undefined ? await resolveRoleDispatch(pi, ctx, catalog, { ...params, role: params.role }) : undefined;
+      signal?.throwIfAborted();
+      const mode = resolved?.plan.context ?? params.context ?? "partial", access = resolved?.plan.access ?? accessMode(params.access);
+      const common = { name: params.name, task: params.task, access, context: mode, contextText: resolved?.contextText ?? params.contextText,
+        snapshot: snapshot(id, mode, ctx), parentSession: ctx.sessionManager.getSessionFile() };
+      const record = await m.launch(resolved ? { ...common, rolePlan: resolved.plan } : { ...common, loadout: loadout(ctx, params) });
       if (signal?.aborted) { await m.cancel(record.id); signal.throwIfAborted(); }
-      return result(`Task accepted (not completed): ${taskSummary(record)}\nSession: ${record.sessionFile}`);
+      const roleSummary = record.rolePlan ? `\nrole=${record.rolePlan.roleId} config=${record.rolePlan.manifestHash.slice(0, 12)} access=${record.access} model=${record.loadout.model} context=${record.context}` : "";
+      return result(`Task accepted (not completed): ${taskSummary(record)}${roleSummary}\nSession: ${record.sessionFile}`);
     },
   });
   pi.registerTool({
@@ -147,11 +165,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   });
   pi.registerTool({
     name: "workflow_run", label: "Run workflow",
-    description: "Define and start a persistent dependency graph of subagent steps. Each step requires access and dependsOn (empty for roots). Workflow initial context is none/partial/full; each step also receives direct dependency results. Default shared mode: full steps run exclusively within this workflow only. Opt-in workspace=isolated permits concurrent writers in detached Git worktrees, requires a clean Git repository and validationCommand, merges dependency code before downstream launch, then integrates and validates without altering the source checkout. Worktrees are not sandboxes. Conflicts pause and preserve worktrees. Failure pauses future dispatch; no automatic retry. Results/questions arrive automatically. Completion is not acceptance: include explicit validation/review steps.",
+    description: "Define and start a persistent dependency graph of subagent steps. Each step requires dependsOn (empty for roots); access is required without role. Steps may select role/model/context/contextText/dependencyReports. Role defaults are frozen at creation; role context=none defaults to omitting dependency reports while code dependencies still merge. Default shared mode: full steps run exclusively within this workflow only. Opt-in workspace=isolated permits concurrent writers in detached Git worktrees, requires a clean Git repository and validationCommand, merges dependency code before downstream launch, then integrates and validates without altering the source checkout. Worktrees are not sandboxes. Conflicts pause and preserve worktrees. Failure pauses future dispatch; no automatic retry. Results/questions arrive automatically. Completion is not acceptance: include explicit validation/review steps.",
     parameters: Type.Object({ ...contextFields, steps: Type.Array(stepSchema, { minItems: 1, maxItems: 64 }), maxParallel: Type.Optional(Type.Integer({ minimum: 1, maximum: 16 })), workspace: Type.Optional(StringEnum(["shared", "isolated"] as const)), validationCommand: Type.Optional(Type.String({ minLength: 1 })) }, { additionalProperties: false }),
     async execute(id, p, signal, _update, ctx) {
       signal?.throwIfAborted(); const mode = p.context ?? "partial";
-      const r = workflow().launch({ ...p, context: mode, snapshot: snapshot(id, mode, ctx), loadout: loadout(ctx, p), parentSession: ctx.sessionManager.getSessionFile() });
+      const rolePlans = await stepPlans(p.steps, ctx, { model: p.model, context: p.context, contextText: p.contextText, cwd: p.cwd });
+      signal?.throwIfAborted();
+      const r = workflow().launch({ ...p, context: mode, rolePlans, snapshot: snapshot(id, "full", ctx), loadout: loadout(ctx, p), parentSession: ctx.sessionManager.getSessionFile() });
       return result(`Workflow accepted (not completed):\n${workflowSummary(r)}`);
     },
   });
@@ -162,7 +182,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       steps: Type.Optional(Type.Array(stepSchema, { minItems: 1, maxItems: 64 })), stepId: Type.Optional(Type.String()),
       message: Type.Optional(Type.String()), access: Type.Optional(accessSchema()),
     }, { additionalProperties: false }),
-    async execute(_id, p, signal) {
+    async execute(callId, p, signal, _update, ctx) {
       signal?.throwIfAborted(); const w = workflow();
       if (p.action === "list") return result([...w.records.values()].map(workflowSummary).join("\n\n") || "No workflows");
       const id = nonempty(p.id, "id");
@@ -170,7 +190,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       else if (p.action === "resume") w.resume(id);
       else if (p.action === "cancel") await w.cancel(id);
       else if (p.action === "cleanup") await w.cleanup(id);
-      else if (p.action === "update") { if (!p.steps) throw new Error("steps required"); w.update(id, p.steps); }
+      else if (p.action === "update") {
+        if (!p.steps) throw new Error("steps required");
+        const r = w.get(id);
+        const rolePlans = await stepPlans(p.steps, ctx, { model: r.loadout.model, context: r.context, contextText: r.contextText, cwd: r.loadout.cwd });
+        signal?.throwIfAborted(); w.update(id, p.steps, rolePlans, snapshot(callId, "full", ctx));
+      }
       else if (p.action === "retry") {
         await w.retry(id, nonempty(p.stepId, "stepId"), nonempty(p.message, "message"), p.access);
         if (signal?.aborted) { await w.cancel(id); signal.throwIfAborted(); }
@@ -196,4 +221,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     },
   });
   for (const type of ["rpc_subagent_result", "rpc_subagent_question", "rpc_workflow_result"]) pi.registerMessageRenderer(type, resultRenderer);
+  async function stepPlans(steps: StepDefinition[], ctx: ExtensionContext, defaults: { model?: string; context?: "none" | "partial" | "full"; contextText?: string; cwd?: string }) {
+    const plans: Record<string, RolePlan> = Object.create(null);
+    for (const step of steps) {
+      if (step.role) plans[step.id] = (await resolveRoleDispatch(pi, ctx, catalog, { ...step, role: step.role, cwd: defaults.cwd }, defaults)).plan;
+      else { accessMode(step.access); if (step.model) selectedModel(ctx, step.model); }
+    }
+    return plans;
+  }
+  await installMainMcpRouter(pi, team);
 }

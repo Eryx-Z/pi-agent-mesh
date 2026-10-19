@@ -7,18 +7,18 @@ This is the **4.0.0 breaking redesign** of the earlier tmux implementation. Requ
 ## Model of operation
 
 - One task → one child process → one persistent session.
-- Each task requires `access: "read-only" | "full"`. Scope and coordination instructions belong in the task text, not an `ownership` field.
+- Non-role tasks require `access: "read-only" | "full"`; role tasks may use their manifest's access default. Scope and coordination instructions belong in task text, not an `ownership` field.
 - Access filters tools; it is **not a filesystem sandbox or lock**. Shared ports, databases, build outputs and edits can still conflict. The parent validates the combined result.
 - Children do not receive delegation tools. Only the parent launches subagents.
 - Optional persistent JSON DAG workflows reuse the same children. Isolated mode supports parallel writable worktrees and validated integration into a separate result worktree. No automatic application to the user checkout, automatic retries, loops, condition-expression language, alternative CLI backends, or background daemon.
 
 ## Three context modes
 
-Context controls information inheritance independently of tool access. Current task execution uses inheritance, not role definitions or profiles; the optional role catalog below is a preview only:
+Context controls information inheritance independently of tool access, for both inherited and role-based tasks:
 
 | Mode | Inherited parent conversation |
 | --- | --- |
-| `none` | None. Task, access and cooperation guidance only (workflow steps also receive direct dependency results). |
+| `none` | None. Task, access and cooperation guidance only; workflow dependency reports are separately controlled. |
 | `partial` (default) | Explicit `contextText` selected/written by the parent. Required; use `none` for an independent task. |
 | `full` | Frozen snapshot of the parent's active conversation branch at dispatch, respecting compaction summaries and retained messages. Includes the current assistant tool-calling message, not abandoned branches or later sibling results. |
 
@@ -26,7 +26,7 @@ Context controls information inheritance independently of tool access. Current t
 
 ## Runtime inheritance
 
-Every new child receives a frozen snapshot of the parent's **active nondelegation tools**, restricted by access, and **all loaded skills**, plus the reserved blocking `ask_question` bridge. No profile or ambient-config tool/skill discovery is used:
+Without `role`, a new child receives a frozen snapshot of the parent's **active nondelegation tools**, restricted by access, and **all loaded skills**, plus the reserved blocking `ask_question` bridge. With `role`, only the role's declared resources are assembled; the parent tool/skill inventory is not inherited. The following describes the **non-role path**:
 
 - `full` preserves the parent's active nondelegation tool capabilities; it does not grant extra OS permissions.
 - `read-only` keeps only verified builtin `read`, `grep`, `find`, `ls` tools already active in the parent, plus `ask_question`. It excludes bash, edits, writes, all extension tools and builtin overrides, and does not load inherited tool-provider extensions. Explicit provider-only entrypoints are loaded separately and do not grant tool access. This is tool filtering, not OS isolation; builtins, skills and host configuration must still be trusted.
@@ -40,13 +40,14 @@ Every new child receives a frozen snapshot of the parent's **active nondelegatio
 
 Automatic extension, skill, prompt-template and context-file (`AGENTS.md`/`CLAUDE.md`) discovery is disabled in children. Required project instructions belong in task/context. Pi's normal system-prompt configuration may still apply, with child cooperation guidance appended; the parent system prompt is not copied. Files backing skills/extensions are not content-pinned: continuation revalidates inventories and metadata, but implementation/body changes with unchanged metadata can change behavior.
 
-**No nested delegation:** this package's creation/management tools, legacy `subagent*` tools and conventional `spawn_agent`/`manage_agents`/`delegate_task` names are excluded. The CLI allowlist prevents providers from enabling extra tools, and the child entrypoint never registers parent controls. Pi has no semantic capability tags: arbitrary custom aliases and general shell tools are not a security sandbox. Do not expose disguised delegation tools; children are instructed not to delegate or launch agent CLIs. All inherited extension code and skills must remain trusted.
+**No nested delegation:** this package's creation/management tools, legacy `subagent*` tools and conventional `spawn_agent`/`manage_agents`/`delegate_task` names are excluded. Non-role children retain the CLI allowlist. Role children discover exact dynamic tool names during preflight, then freeze active tools and enforce direct/nested call guards before task submission. The child entrypoint never registers parent controls. Pi has no semantic capability tags: arbitrary custom aliases and general shell tools are not a security sandbox. Do not expose disguised delegation tools; children are instructed not to delegate or launch agent CLIs. All inherited extension code and skills must remain trusted.
 
-## Role catalog preview (M1)
+## Role team: shortest startup
 
-**The catalog is available; PM activation and public role-based dispatch are not implemented yet.** `enabled: true` currently enables configuration/catalog validation only. It does not change your main prompt, tool access, or the existing `subagent` / workflow API. Do not add a `role` argument to those APIs yet. Catalog queries require Pi **1.0.2+ (1.x)**; the existing non-role path keeps its prior version requirements. Keep the host's Pi dependency family aligned, not just its CLI/AI/TUI packages. A fresh install of those three at 1.0.2 can resolve incompatible 1.3.x `pi-agent-core` / `pi-codemode` / `pi-mcp` dependencies and fail before extension loading. For the tested 1.0.2 setup, align those packages and `@earendil-works/chord` to 1.0.2 as well.
+Role mode requires aligned Pi **1.0.2+ (1.x)**; the verified role integration baseline is **1.0.2** on Node **22.19+**. The non-role path retains **>=0.99.0 <2** compatibility. Keep the entire Pi dependency family aligned, not just CLI/AI/TUI: mismatched `pi-agent-core`, `pi-codemode`, `pi-mcp` or `chord` versions can fail before extension loading. Do not interpret the peer range as role-mode validation on every 1.x release.
 
-Create `<startup cwd>/.pi/agent-mesh.yaml` (or copy `examples/team/.pi/agent-mesh.yaml`):
+1. Install with `pi install npm:pi-agent-mesh` (or use the isolated trial command below).
+2. Create `<startup cwd>/.pi/agent-mesh.yaml`:
 
 ```yaml
 schema_version: 1
@@ -60,19 +61,31 @@ roles:
 mcp_servers: {}
 ```
 
-Use `/roles` to list the selected roles, `/roles inspect builder` for declared resources, and `/roles reload` to validate and atomically replace the directory. The parent-only `roles_list` tool returns compact summaries. Queries do **not** import local tool modules, connect role MCP servers, or establish service readiness. Prompts and skills are read for validation, not injected into the main session.
+3. Start a **new persistent** `pi` session in that directory with an authenticated model. Ask PM to delegate implementation, verification and independent review by role, supplying scope and acceptance conditions. Do not use `--no-session`.
 
-`PI_AGENT_MESH_CONFIG` selects an explicit path relative to startup cwd; otherwise only the default location is checked, with no upward search. The selection is captured at parent startup. A missing default or `enabled: false` yields a disabled catalog. An explicit missing path or invalid configuration is an error, not an empty successful directory. Failed reload retains the previous directory and reports the static error; reload does not change running tasks. Catalog loading is lazy until the first query, so ordinary legacy sessions do not load the new parser.
+No external MCP or custom tools are needed. PM has reading/coordination tools; Builder has editing and shell; Tester has shell but no edit/write tools; Reviewer defaults to read-only and `none` context. Workers gain their own declared capabilities, **not an intersection with PM's tools**. PM-only management tools are runtime-injected, never granted to workers. Tool filtering is not a sandbox: shell can modify files regardless of tool names.
 
-Role references may also name manifest files relative to the team config's canonical directory. Manifest resource paths are relative to the canonical manifest directory. Once loaded, the canonical config identity stays fixed for reload; changing the selected file requires a new session. Roles are explicitly registered; neighboring files and directories are not scanned or merged. Unknown fields, duplicate names, mismatched IDs, missing resources, and malformed UTF-8/YAML are rejected with source/field diagnostics. Public JSON schemas in `schemas/` are also used by runtime validation.
+See [the minimal team](examples/team/README.md) and [the deterministic offline demo](examples/role-v1-demo/README.md). The demo uses real Pi RPC and actual write/bash/read execution, with a scripted local provider instead of model quota. Separate [optional local-tool, stdio and HTTP MCP examples](examples/role-resources/README.md) include passive production-parser validation; external service readiness is not established.
 
-The package includes four independent role manifests, prompts, and skills: PM (reading/coordination), Builder (editing and shell), Tester (shell verification), Reviewer (`none` + read-only). These are declarations for future role execution, **not currently applied restrictions**. Shell access is not a sandbox. Custom manifests declare exact builtin tools, exact `SKILL.md` paths, MCP server/raw-tool references, and tool-only extension entries. Their availability and executable-tool contract are checked during future execution preflight, not by the passive catalog. See `roles/builder/role.yaml` and the two schemas for the full configuration shape.
+### Configuration and catalog
 
-MCP config accepts stdio `command/args/cwd/env` or HTTP `url/headers`, plus timeout and description; exposure overrides, OAuth configuration, and credential-command evaluation are not accepted. Environment references remain unresolved in catalog snapshots; missing referenced variables are diagnosed without showing values. Role MCP never supplements its declarations from ambient `mcp.json`. This catalog guarantee does not disable the host's independently configured MCP extensions in an ordinary non-PM session.
+`PI_AGENT_MESH_CONFIG` selects an explicit path relative to startup cwd; otherwise only the default location is checked, with no upward search. A missing default or `enabled: false` preserves ordinary non-team sessions. An explicit missing path or invalid enabled configuration fails PM startup rather than silently falling back.
 
-### Internal role execution engine (M2–M3)
+Use `/roles` to list selected roles, `/roles inspect builder` for declared resources, and the parent-only `roles_list` tool for compact summaries. These queries do **not** import local tools, connect servers, or establish readiness. `/roles reload` validates and atomically replaces the dispatch directory; failure retains the previous valid directory. Success affects only **new tasks/workflows and explicitly updated unstarted steps**, not PM's own resources, running tasks, or frozen workflows. Start a new session to adopt a changed PM role or config selection.
 
-The internal `TaskManager` now accepts a frozen `rolePlan` instead of an inherited loadout. This is not yet connected to the public `subagent` or workflow tools; continue using their existing parameters. Native MCP role execution is available internally; PM/public role integration remains M4.
+Role references can name manifests relative to the canonical team config directory; resource paths are relative to the canonical manifest directory. Only explicit roles and exact `SKILL.md` paths are loaded, with no neighboring scans or deep merges. Unknown fields, duplicate names, mismatched IDs and missing resources fail with source/field diagnostics. The runtime uses the public JSON schemas in `schemas/`. See `roles/builder/role.yaml` for the manifest shape: prompt file, skills, builtin tools, selected MCP tools, local-tool entries and defaults.
+
+### PM persistence and readiness
+
+Before its first model request, PM persists an `agent_mesh_pm` session entry containing its frozen RolePlan, actual tool definitions/provenance, prompt-composition version and canonical team config path. Resume, session switch and extension reload restore that snapshot, not today's `main_role`. Changing/deleting the original manifest or prompt does not replace the saved body. Actual skills/local entries/tool definitions must still reconstruct without drift. History remains inspectable on failure.
+
+The dispatch directory is loaded separately. If it is now invalid, a valid saved PM can still manage existing tasks; new role dispatch fails until configuration is fixed and `/roles reload` succeeds. It does not silently become a different PM.
+
+PM transitions through `initializing / ready / failed`. User input and internal result/question/recovery notifications share the readiness gate. Notifications queue while initializing, flush only when ready, and cannot automatically start a model turn after failure. Cleanup and ownership checks can still run. Catalog presence or server registration alone is not readiness.
+
+Local-tool imports and MCP execution follow Pi's project trust state; catalog inspection itself is passive. Grant project trust through the host only after reviewing executable resources. PM startup or role dispatch with required executable resources refuses an untrusted project. The builtins-only minimal team needs no such resources.
+
+### Role execution and snapshots
 
 The engine assembles only declared builtins, exact progressive skills, and selected local tools. It saves a private task/run/attempt/nonce-bound preflight result, validates actual tool definitions and sources, then persists a per-run snapshot and cumulative verified-definition baseline **before** submitting a model prompt. Exact active-tool and direct/nested call guards apply independently of parent capabilities. `read-only` does not import local tools or connect MCP.
 
@@ -80,9 +93,11 @@ Local tool entries must export a factory that only calls `pi.registerTool(...)` 
 
 V3 role records preserve original task/context input, the role body, authorized capabilities, and each run's effective access. Continuation does not reread the manifest or prompt. Skills and enabled local entry hashes, tool schemas and sources are rechecked; access tightening does not erase the verified baseline. A failed upgrade does not replace a valid snapshot. History remains readable after resource deletion. Before any possible submission, recovery can reconstruct the original session seed from saved input; after any run may have submitted work, a missing transcript is an error, not permission to replay it. These guarantees do not content-pin referenced scripts/packages or remote implementations.
 
-### Native role MCP (M3)
+### Native role MCP
 
-Internal full-access role tasks use Pi's native stdio/Streamable HTTP clients, transports and result conversion. Only role-selected servers connect; global/project `mcp.json` and extension registrations do not supplement them. Unselected tools and automatic resource tools never enter the real child registry. Selected tools are direct; codemode/tool_search are not auto-enabled. Raw tool names map to Pi's actual collision-safe names, with server/config identity and complete remote-definition hashes retained for drift checks.
+Team `mcp_servers` accepts stdio `command/args/cwd/env` or Streamable HTTP `url/headers`, plus `timeout/description`. Command is an executable, not a shell string; omitted stdio cwd uses the actual task/worktree cwd. Explicit relative server cwd is resolved against the team config directory; args remain literal. Manifests select server IDs and exact **raw** tool names. Exposure overrides, OAuth/login flows and credential-command evaluation are not supported.
+
+Full-access role tasks use Pi's native stdio/Streamable HTTP clients, transports and result conversion. Only role-selected servers connect; global/project `mcp.json` and extension registrations do not supplement them. Unselected tools and automatic resource tools never enter the real child registry. Selected tools are direct; codemode/tool_search are not auto-enabled. Raw tool names map to Pi's actual collision-safe names, with server/config identity and complete remote-definition hashes retained for drift checks.
 
 Role startup has one 30-second absolute deadline, including process readiness and discovery. Failed connections, missing credentials/tools, invalid schemas and deadline expiry fail before the model prompt and close owned resources. Cancelling readiness uses a private command to settle the pending preflight before normal RPC shutdown. Native per-request timeouts are separate: progress can reset them, but parent cancellation still aborts the request. HTTP close releases the task's client, not the remote server or its side effects.
 
@@ -102,7 +117,17 @@ Environment/header references resolve in the child, stay unresolved in persisted
 }
 ```
 
-Required: `task`, `access`. Optional: `name`, `model`, `cwd`, `context`, `contextText`. `contextText` is only accepted in `partial` mode. Names default to the context mode (`none`, `partial`, `full`); all names are deduplicated.
+Required: `task`, and **`access` when no `role` is supplied**. Optional: `role`, `access`, `name`, `model`, `cwd`, `context`, `contextText`. `contextText` is only accepted in `partial` mode. Names default to the context mode (`none`, `partial`, `full`); all names are deduplicated.
+
+Role dispatch uses explicit call model > role non-`inherit` model > parent model; context uses explicit call > explicitly declared role context > `partial`; access uses explicit call > required role access default. `partial` always needs nonempty `contextText`. `inherit` is a manifest value, not a callable model ID. For example:
+
+```json
+{ "role": "builder", "task": "Implement the scoped fix", "contextText": "Owned paths, requirements and acceptance checks" }
+{ "role": "tester", "task": "Run the focused tests", "contextText": "Exact test target and expected result" }
+{ "role": "reviewer", "task": "Independently inspect the code against the stated requirements" }
+```
+
+Receipts/inspect include role ID, configuration digest and effective access/model/context; inspect distinguishes declared available capabilities from this run's enabled tools and preflight state. `full` never adds undeclared capabilities. Role `read-only` retains only declared verified builtin read/grep/find/ls plus `ask_question`, removing local tools and MCP **before** loading/connecting them.
 
 Startup failures include the failing phase, target model, child agent directory, original error and a troubleshooting hint. Known credential, model/provider and loadout/extension errors are distinguished; unknown startup errors remain generic. Credential errors arriving after RPC acceptance also receive guidance. Classification is best-effort, not an authentication probe: preflight does not call the provider, and no automatic retry or account switch is added.
 
@@ -124,7 +149,7 @@ For an independent review use `context: "none"`; for a continuation of a complex
 
 `id` accepts the stable UUID or unique task name. `message` only targets a running task; use `continue` explicitly for a finished task. RPC acceptance means accepted/queued, not proven executed. When a question is pending, use `answer` with its ID instead of an ordinary message. Duplicate and stale answers are rejected.
 
-`history` returns bounded tool calls/results from the retained session (default 20 entries, maximum 100). It is evidence of operations, **not an exact filesystem attribution audit**. Inspect actual diffs and verification too. A stopped standalone task can be continued with `access: "read-only"` to request explanations; new tasks retain their original access when omitted. Legacy records without `access` remain readable but require an explicit choice before continuation. Workflow steps use `workflow_control retry` rather than direct continuation.
+`history` returns bounded tool calls/results from the retained session (default 20 entries, maximum 100). It is evidence of operations, **not an exact filesystem attribution audit**. Inspect actual diffs and verification too. A stopped standalone task can be continued with `access: "read-only"` to request explanations; continuation retains its saved access when omitted. Continue cannot select a new role; create a new task to change roles. Explicit full continuation may first discover previously disabled but originally authorized resources; later full runs still compare the cumulative verified definitions. Legacy records without `access` remain readable but require an explicit choice before continuation. Workflow steps use `workflow_control retry` rather than direct continuation.
 
 ### Workflows: `workflow_run` / `workflow_control`
 
@@ -143,7 +168,29 @@ For an independent review use `context: "none"`; for a continuation of a complex
 }
 ```
 
-Definitions contain 1–64 steps, unique IDs, existing dependencies and no cycles. `maxParallel` is 1–16 (default 3). Context defaults to `partial`, requiring `contextText`; `full` freezes the current branch **once per workflow**, not once per step. Each step also receives bounded direct-upstream reports and their session paths. Reports are claims, not acceptance proof. Running tests usually requires `full` because `read-only` excludes bash.
+Definitions contain 1–64 steps, unique IDs, existing dependencies and no cycles. `maxParallel` is 1–16 (default 3). Legacy steps retain workflow-level context: `partial` requires `contextText`, and `full` freezes the branch at workflow creation. By default they also receive bounded direct-upstream reports and session paths. Reports are claims, not acceptance proof. Running tests usually requires `full` because `read-only` excludes bash.
+
+#### Per-step roles and context
+
+Each step accepts `role`, `model`, `context`, `contextText`, `dependencyReports`, and optional `access` (required without role). For role steps:
+
+- Model: step explicit provider/model > role non-`inherit` default > workflow explicit model > parent current model.
+- Context: step explicit > role explicitly declared default > workflow context > `partial`. Omitted role context/model does not hide workflow defaults.
+- Partial text: step `contextText` > workflow `contextText`; missing text fails workflow creation. Text is not accepted for non-partial steps.
+- Access: step explicit > role default. `dependencyReports`: explicit `include`/`omit` > role `none` defaults to `omit`; otherwise defaults to `include` (including legacy steps).
+
+```json
+{
+  "context": "partial",
+  "contextText": "Requirements and acceptance checks",
+  "steps": [
+    { "id": "build", "role": "builder", "task": "Implement the change", "context": "partial", "dependsOn": [] },
+    { "id": "review", "role": "reviewer", "task": "Inspect code against the stated requirements", "context": "none", "dependencyReports": "omit", "dependsOn": ["build"] }
+  ]
+}
+```
+
+`omit` removes upstream report text and session links, **not dependency code merging** in isolated mode. Put independent review requirements in the review task itself. Each step's role plan/defaults and any full parent-history snapshot freeze at creation; dispatch only binds actual worktree cwd. Reload does not replace them. Explicit updates of unstarted steps generate new plans; resource drift pauses before model submission. Reports remain untrusted claims, not structured verdicts. No automatic repair round or merge follows a natural-language review finding.
 
 Default `workspace: "shared"`: read-only steps may overlap; a full step runs alone **within its own workflow**. Other workflows, standalone subagents and external writers are not locked. Failure pauses new dispatch; active siblings finish normally. Questions use the existing child answer tool.
 
@@ -188,7 +235,7 @@ The main session has a compact live widget (up to five rows), showing task name/
 
 Use **`/subagents`** for the live dashboard. It covers the full terminal while open (the conversation is hidden) and starts on **Prompt**. Press **Esc** to return to the conversation. A single outer frame separates the task list from details with one divider (side-by-side on wide terminals, stacked on narrow terminals). The selected task's name, state and saved `provider/model` ID stay in the header. Plain shortcut hints show **1 Overview**, **2 Prompt**, **3 Activity**, and **4 Trace**; the current view is highlighted and **Focus: Tasks/Detail** shows where the arrow keys act:
 
-- **Overview** opens at the top with access, thinking/context, shutdown status, questions and errors. Long IDs/session paths are omitted from this compact view.
+- **Overview** opens at the top with access, thinking/context, shutdown status, questions and errors. Role tasks additionally show role/config identity, declared versus effective capabilities and preflight state. Long IDs/session paths are omitted from this compact view.
 - **Prompt** shows the complete parent-assigned task prompt (including direct dependency reports for workflow steps), not the generated system prompt or inherited conversation.
 - **Activity** follows the latest assistant text and recent log. Manual scrolling pauses follow; **End** resumes it.
 - **Trace** opens at the top of the child's complete recorded session JSONL, shown as pretty JSON without display truncation: messages, emitted thinking, tool-call parameters/results and other records. It may include inherited context and is not unrecorded internal reasoning. **End** follows newly recorded entries; manual scrolling pauses follow and **Home** returns to the start. Missing files and incomplete/malformed JSONL lines are shown as nonfatal notices (raw incomplete lines are retained). Terminal control sequences are removed. Only the selected Trace is loaded, and unchanged file contents are cached for the dashboard interaction.
@@ -232,6 +279,16 @@ No human confirmation is needed or offered. Legacy records without an execution 
 
 An owner-wide cap defaults to **8 child tasks**, configurable through `PI_SUBAGENT_MAX_CONCURRENT` (positive integer). It includes standalone and workflow children plus unconfirmed orphan records. Workflows wait for capacity; standalone launch/continue and explicit retry reject when full. Other parent processes are not counted. Validation commands have a separate ten-minute deadline and are not child-agent slots; ordinary agent tasks have no total execution deadline. Assign a small number of independent tasks and cancel unwanted work. RPC command acknowledgements have a 15-second timeout; unknown acceptance causes failure/cleanup, never blind re-submission. Cancellation first waits a bounded time for outstanding prompt preflight receipts, including late receipts after caller timeout, then clears queued work and waits for an abort/idle acknowledgement before stdin shutdown, with bounded signal escalation. For hosts without `clear_queue` over RPC, the defensive compatibility path aborts and then requires `get_state` to prove that the queue is empty; otherwise shutdown remains unconfirmed and retains the lock. This fallback does not imply support for Pi versions below the required API minimum. New submissions are rejected while stopping; an idle abort alone cannot confirm cleanup while a prompt hook remains unresolved. If agent/tool cleanup or process exit cannot be confirmed, cancellation reports failure and retains the lock; root-process exit alone is not confirmation. An accepted prompt consumed by an input hook without starting or queueing work fails explicitly instead of remaining live. For scoped executions, verified cgroup cleanup can establish shutdown even when RPC abort acknowledgement failed. Without a scope, arbitrary daemonized commands remain outside the lifecycle guarantee. Linux/macOS process groups are supported; full Windows descendant cleanup is not yet validated.
 
+## Role troubleshooting and limits
+
+- Invalid config: follow the source file and field diagnostic; use `/roles inspect <id>` and fix missing paths/unknown fields, then `/roles reload`. A bad reload retains the prior valid directory.
+- PM failed/not ready: inspect status and saved failure/session entries. Fix model authentication, trust, missing resources or service readiness; use a new session when changing PM's frozen configuration. Do not bypass readiness by injecting internal turns. Readiness fails at its deadline even for a stalled local factory. Host model authentication has no cancellation API: after timeout, session shutdown/replacement waits for the outstanding model-selection operation to settle, rather than permitting late writes into a replacement. An indefinitely stalled auth provider can therefore hold replacement; fix the provider or restart Pi.
+- `partial` error: supply meaningful `contextText` (step text overrides workflow text), or deliberately choose `none`. `full` does not supply missing tools.
+- Continuation drift: restore the saved skill/local entry/tool definition, or create a new task to authorize new resources. Reload is not permission to mutate an old task's role. Remote credential references may rotate; resolved secrets are not persisted in plans.
+- MCP failure: check the named role/server, environment reference, transport, required raw tool names and 30-second readiness deadline. Registration/catalog presence is not proof of a connection. No model request occurs on a failed preflight; no automatic account switch or side-effect replay is attempted.
+
+All executable local code and selected servers must be trusted. Hashes freeze the manifest, role body, skill files and local entrypoints, **not** their transitive scripts/packages or remote implementations. Tool access is not OS isolation. Natural-language verdicts are not machine-enforced acceptance; no automatic repair rounds, automatic application/merge, role marketplace or cross-task MCP connection pool is provided. Native MCP request timeouts (which progress may reset) are not total task deadlines. The offline demo proves deterministic plumbing, not real-model reasoning or your provider's authentication.
+
 ## Development and isolated trial
 
 ```bash
@@ -254,8 +311,11 @@ This intentionally disables the currently installed subagent extension for this 
 
 - `index.ts`: tools, session lifecycle, parent notifications
 - `loadout.ts`: live runtime snapshots, canonical sources and inherited-loadout verification
-- `roles.ts`: passive team/role validation, canonical resource metadata, atomic catalog reload
-- `roles-ui.ts`: parent-only catalog preview commands and summaries (no PM activation)
+- `roles.ts`: team/role validation, canonical resource metadata, atomic catalog reload
+- `roles-ui.ts`: parent-only catalog commands and summaries
+- `pm.ts`: main-role assembly, persistent PM snapshots and readiness/notification gates
+- `role-dispatch.ts`: shared standalone/workflow role defaults and trust checks
+- `workflows.ts`: frozen per-step plans, DAG scheduling, worktrees and report policy
 - `role-loadout.ts`: frozen role plans, actual snapshots, effective-access and historical-definition validation
 - `role-tools.ts` / `role-child.ts`: isolated local-tool selection and role-only child preflight/call guards
 - `role-mcp.ts`: selected native MCP configuration, discovery, credential handling and lifecycle

@@ -22,7 +22,7 @@ function setup(config?: string) {
   for (const key of Object.keys(env)) if (key.startsWith("PI_RPC_SUBAGENT_") || key.startsWith("PI_SUBAGENT_")) delete env[key];
   if (config) writeFileSync(configPath, config);
   const rpc = new RpcProcess({ command: process.execPath, cwd: dir, env, args: [cli, "--mode", "rpc", "--session", join(dir, "parent.jsonl"),
-    "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-approve", "--tools", "read,roles_list", "--model", "m0-fixture/test", "--thinking", "off", "-e", provider, "-e", entry] });
+    "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--no-approve", "--model", "m0-fixture/test", "--thinking", "off", "-e", provider, "-e", entry] });
   const events: { type: string; [key: string]: any }[] = [];
   rpc.on("event", e => events.push(e));
   const command = async (message: string) => {

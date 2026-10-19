@@ -1,0 +1,14 @@
+schema_version: 1
+enabled: true
+main_role: pm
+roles:
+  pm: builtin:pm
+  directory_reader: ./role.yaml
+mcp_servers:
+  filesystem:
+    type: stdio
+    command: mcp-server-filesystem
+    args: ["."]
+    cwd: .
+    timeout: 10000
+    description: Optional separately installed native filesystem MCP server

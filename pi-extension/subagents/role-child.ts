@@ -141,7 +141,7 @@ export default async function roleChild(pi: ExtensionAPI) {
     assertRoleHostVersion();
     if (Date.now() >= readinessDeadline) throw new Error("Role readiness deadline expired");
     validateRolePlan(plan, { access: run.access });
-    local = await loadRoleTools(plan, run.access);
+    local = await loadRoleTools(plan, run.access, AbortSignal.any([startupAbort.signal, AbortSignal.timeout(Math.max(1, readinessDeadline - Date.now()))]));
     local.register(pi);
     if (effective.mcp.length) {
       implementationSources.set(ROLE_MCP_EXTENSION, hashFile(ROLE_MCP_EXTENSION));

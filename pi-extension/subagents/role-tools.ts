@@ -55,10 +55,23 @@ export function toolOnlyFactory(factory: (pi: ExtensionAPI) => unknown) {
   };
 }
 
+/** Race owned initialization against its shared deadline/cancellation signal. */
+export async function waitForRoleResource<T>(operation: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return operation;
+  let onAbort: (() => void) | undefined;
+  try {
+    return await Promise.race([operation, new Promise<never>((_, reject) => {
+      onAbort = () => reject(signal.reason ?? new Error("Role initialization aborted"));
+      signal.addEventListener("abort", onAbort, { once: true });
+      if (signal.aborted) onAbort();
+    })]);
+  } finally { if (onAbort) signal.removeEventListener("abort", onAbort); }
+}
 /** Trusted JavaScript, NOT a sandbox. The independent, never-bound runtime cannot
  * mutate a real session. Only execute's supplied ctx can access that session.
  */
-export async function loadRoleTools(plan: LocalPlan, access: AccessMode = "full") {
+export async function loadRoleTools(plan: LocalPlan, access: AccessMode = "full", signal?: AbortSignal) {
+  signal?.throwIfAborted();
   accessMode(access);
   let closed = false;
   const sources: LocalSource[] = [];
@@ -106,7 +119,7 @@ export async function loadRoleTools(plan: LocalPlan, access: AccessMode = "full"
       // No subscriptions survive even failed factories, and no events reach the host.
       const bus = { on: () => unsupported("events.on"), emit: () => unsupported("events.emit") };
       try {
-        const { loadExtensions } = await publicLoader();
+        const { loadExtensions } = await waitForRoleResource(publicLoader(), signal);
         // No discovery and no real session: import this one canonical entry through
         // a private adapter which exposes only the ToolDefinition registrar.
         const dir = mkdtempSync(join(tmpdir(), "role-local-loader-")); chmodSync(dir, 0o700);
@@ -114,8 +127,9 @@ export async function loadRoleTools(plan: LocalPlan, access: AccessMode = "full"
         let loaded: Awaited<ReturnType<typeof loadExtensions>>;
         try {
           writeFileSync(shim, `import factory from ${JSON.stringify(entry)};\nimport {toolOnlyFactory} from ${JSON.stringify(fileURLToPath(import.meta.url))};\nexport default toolOnlyFactory(factory);\n`, {mode: 0o600, flag: "wx"});
-          loaded = await loadExtensions([realpathSync(shim)], plan.cwd, bus, guarded);
+          loaded = await waitForRoleResource(loadExtensions([realpathSync(shim)], plan.cwd, bus, guarded), signal);
         } finally { rmSync(dir, {recursive: true, force: true}); }
+        signal?.throwIfAborted();
         if (loaded.errors.length) throw new Error(loaded.errors.map(e => e.error).join("; "));
         const ext = loaded.extensions[0];
         if (!ext || loaded.extensions.length !== 1) throw new Error(`Missing local tool entry: ${entry}`);

@@ -41,10 +41,10 @@ test('child question tool awaits RPC UI answer, respects abort and enforces sequ
     rmSync(dir, { recursive: true, force: true });
   }
 });
-test('parent extension exposes discoverable control/UI; cannot register spawning in a child', () => {
+test('parent extension exposes discoverable control/UI; cannot register spawning in a child', async () => {
   const tools: any[] = [], commands: string[] = [], events: string[] = [];
-  const api = { on: (name: string) => events.push(name), registerTool: (t: any) => tools.push(t), registerCommand: (name: string) => commands.push(name), registerMessageRenderer() {} } as any;
-  entry(api);
+  const api = { on: (name: string) => events.push(name), registerTool: (t: any) => tools.push(t), registerCommand: (name: string) => commands.push(name), registerMessageRenderer() {}, registerToolRenderer() {} } as any;
+  await entry(api);
   assert.deepEqual(tools.map(t => t.name), ['roles_list', 'subagent', 'subagent_control', 'workflow_run', 'workflow_control']);
   assert.ok(commands.includes('roles'));
   assert.ok(commands.includes('subagents')); assert.ok(events.includes('session_shutdown'));
@@ -52,11 +52,12 @@ test('parent extension exposes discoverable control/UI; cannot register spawning
   assert.equal(subagent.parameters.properties.contextText.type, 'string');
   assert.equal(subagent.parameters.properties.agent, undefined);
   assert.equal(subagent.parameters.properties.ownership, undefined);
-  assert.ok(subagent.parameters.required.includes('access'));
+  assert.ok(!subagent.parameters.required.includes('access'), 'Role calls may use manifest access; non-role access is checked before launch');
+  assert.equal(subagent.parameters.properties.role.type, 'string');
   assert.ok(commands.includes('workflows'));
   assert.equal(subagent.parameters.additionalProperties, false);
   const previous = process.env.PI_RPC_SUBAGENT_CHILD;
   process.env.PI_RPC_SUBAGENT_CHILD = '1';
-  try { entry({} as any); }
+  try { await entry({} as any); }
   finally { if (previous === undefined) delete process.env.PI_RPC_SUBAGENT_CHILD; else process.env.PI_RPC_SUBAGENT_CHILD = previous; }
 });

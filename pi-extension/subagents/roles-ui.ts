@@ -5,7 +5,7 @@ import { readFileSync } from "node:fs";
 import { bounded } from "./store.ts";
 import type { RoleCatalog, ResolvedRole } from "./roles.ts";
 
-const PREVIEW = "Role catalog preview (M1; no PM activation or role dispatch). Service readiness is not checked.";
+const PREVIEW = "Role catalog preview (static declarations only). Service readiness is not checked.";
 function summary(role: ResolvedRole): string {
   return `${role.id}: ${role.description}\n  source: ${role.source}\n  defaults: access=${role.defaults.access}, context=${role.defaults.context ?? "unspecified"}, model=${role.defaults.model ?? "inherit"}`;
 }
@@ -24,15 +24,26 @@ function inspection(role: ResolvedRole): string {
     "Declarations only; no service connection or extension execution has been performed."].join("\n");
 }
 
-/** Passive M1 surface. Do not activate a PM or load executable role resources here. */
-export function registerRoles(pi: ExtensionAPI): void {
+/** Passive directory shared by PM activation and dispatch; queries never execute resources. */
+export interface RoleCatalogAccess {
+  current(ctx: ExtensionContext): Promise<RoleCatalog>;
+  pin(ctx: ExtensionContext, configPath: string): void;
+  summary(ctx: ExtensionContext): Promise<string>;
+}
+export function registerRoles(pi: ExtensionAPI): RoleCatalogAccess | undefined {
   if (process.env.PI_RPC_SUBAGENT_CHILD === "1") return;
   let startup: { cwd: string; explicitPath: string } | undefined;
   let pending: Promise<RoleCatalog> | undefined;
+  let restoredPath: string | undefined;
   const capture = (ctx: ExtensionContext) => {
     startup ??= { cwd: ctx.cwd ?? process.cwd(), explicitPath: process.env.PI_AGENT_MESH_CONFIG ?? "" };
   };
-  pi.on("session_start", (_event, ctx) => { capture(ctx); });
+  pi.on("session_start", (_event, ctx) => {
+    capture(ctx);
+    // A resumed PM may select its saved directory, but that selection must not
+    // replace the process-start config for a later newly-created session.
+    restoredPath = undefined; pending = undefined;
+  });
   async function current(ctx: ExtensionContext): Promise<RoleCatalog> {
     capture(ctx);
     // Keep the old no-role runtime free of new parser/native-MCP dependencies.
@@ -43,7 +54,7 @@ export function registerRoles(pi: ExtensionAPI): void {
         throw new Error("Role catalog requires Pi 1.0.2 or newer (1.x); legacy non-role calls remain available.");
       }
       const { RoleCatalog } = await import("./roles.ts");
-      return new RoleCatalog(startup!.cwd, startup!.explicitPath);
+      return new RoleCatalog(startup!.cwd, restoredPath ?? startup!.explicitPath);
     })();
     const catalog = await pending;
     if (!catalog.current && !catalog.error) {
@@ -73,7 +84,7 @@ export function registerRoles(pi: ExtensionAPI): void {
   });
   pi.registerTool({
     name: "roles_list", label: "Role catalog",
-    description: "List configured role summaries and static errors. Catalog preview only: does not dispatch agents, connect MCP, or assert role readiness.",
+    description: "List configured role summaries and static errors. Static catalog only: does not connect MCP or assert role readiness.",
     parameters: Type.Object({}, { additionalProperties: false }),
     async execute(_id, _params, signal, _update, ctx) {
       signal?.throwIfAborted();
@@ -82,4 +93,8 @@ export function registerRoles(pi: ExtensionAPI): void {
       return { content: [{ type: "text", text: bounded(listing(catalog), 16000) }], details: {} };
     },
   });
+  return { current, pin(ctx, configPath) {
+    capture(ctx);
+    if ((restoredPath ?? startup!.explicitPath) !== configPath) { restoredPath = configPath; pending = undefined; }
+  }, async summary(ctx) { return listing(await current(ctx)); } };
 }
