@@ -70,15 +70,23 @@ The package includes four independent role manifests, prompts, and skills: PM (r
 
 MCP config accepts stdio `command/args/cwd/env` or HTTP `url/headers`, plus timeout and description; exposure overrides, OAuth configuration, and credential-command evaluation are not accepted. Environment references remain unresolved in catalog snapshots; missing referenced variables are diagnosed without showing values. Role MCP never supplements its declarations from ambient `mcp.json`. This catalog guarantee does not disable the host's independently configured MCP extensions in an ordinary non-PM session.
 
-### Internal role execution engine (M2)
+### Internal role execution engine (M2–M3)
 
-The internal `TaskManager` now accepts a frozen `rolePlan` instead of an inherited loadout. This is not yet connected to the public `subagent` or workflow tools; continue using their existing parameters. MCP role execution is deferred to M3, and PM/public role integration to M4.
+The internal `TaskManager` now accepts a frozen `rolePlan` instead of an inherited loadout. This is not yet connected to the public `subagent` or workflow tools; continue using their existing parameters. Native MCP role execution is available internally; PM/public role integration remains M4.
 
-The engine assembles only declared builtins, exact progressive skills, and selected local tools. It saves a private task/run/attempt/nonce-bound preflight result, validates actual tool definitions and sources, then persists a per-run snapshot and cumulative verified-definition baseline **before** submitting a model prompt. Exact active-tool and direct/nested call guards apply independently of parent capabilities. `read-only` does not import local tools or connect MCP; a full plan containing MCP fails explicitly in M2.
+The engine assembles only declared builtins, exact progressive skills, and selected local tools. It saves a private task/run/attempt/nonce-bound preflight result, validates actual tool definitions and sources, then persists a per-run snapshot and cumulative verified-definition baseline **before** submitting a model prompt. Exact active-tool and direct/nested call guards apply independently of parent capabilities. `read-only` does not import local tools or connect MCP.
 
 Local tool entries must export a factory that only calls `pi.registerTool(...)` and returns void (or a promise of void). No hooks, commands, flags, providers, MCP registrations, `pi.exec`, or captured session APIs are allowed; tools use their `execute` context instead. A guarded factory adapter collects definitions in an isolated, never-bound loader and registers only selected tools as direct. Importing local JavaScript still executes trusted code: this is an API contract, **not a sandbox**. Pi 1.0.2 does not export `loadExtensions` from its package root; the adapter isolates access to its installed `dist/core/extensions/index.js`, covered by real RPC tests.
 
 V3 role records preserve original task/context input, the role body, authorized capabilities, and each run's effective access. Continuation does not reread the manifest or prompt. Skills and enabled local entry hashes, tool schemas and sources are rechecked; access tightening does not erase the verified baseline. A failed upgrade does not replace a valid snapshot. History remains readable after resource deletion. Before any possible submission, recovery can reconstruct the original session seed from saved input; after any run may have submitted work, a missing transcript is an error, not permission to replay it. These guarantees do not content-pin referenced scripts/packages or remote implementations.
+
+### Native role MCP (M3)
+
+Internal full-access role tasks use Pi's native stdio/Streamable HTTP clients, transports and result conversion. Only role-selected servers connect; global/project `mcp.json` and extension registrations do not supplement them. Unselected tools and automatic resource tools never enter the real child registry. Selected tools are direct; codemode/tool_search are not auto-enabled. Raw tool names map to Pi's actual collision-safe names, with server/config identity and complete remote-definition hashes retained for drift checks.
+
+Role startup has one 30-second absolute deadline, including process readiness and discovery. Failed connections, missing credentials/tools, invalid schemas and deadline expiry fail before the model prompt and close owned resources. Cancelling readiness uses a private command to settle the pending preflight before normal RPC shutdown. Native per-request timeouts are separate: progress can reset them, but parent cancellation still aborts the request. HTTP close releases the task's client, not the remote server or its side effects.
+
+Environment/header references resolve in the child, stay unresolved in persisted plans, and can rotate between runs. OAuth/login, credential commands and user-config writes are disabled on this path. Native connection diagnostics are sanitized; server log notifications are not persisted. Normal tool results preserve native text/images/structured content and the distinction between `isError` and protocol failures. As with all tool output, do not ask services to echo credentials. Tests use local deterministic peers and model fixtures, not external accounts.
 
 ## Tools
 
@@ -250,6 +258,7 @@ This intentionally disables the currently installed subagent extension for this 
 - `roles-ui.ts`: parent-only catalog preview commands and summaries (no PM activation)
 - `role-loadout.ts`: frozen role plans, actual snapshots, effective-access and historical-definition validation
 - `role-tools.ts` / `role-child.ts`: isolated local-tool selection and role-only child preflight/call guards
+- `role-mcp.ts`: selected native MCP configuration, discovery, credential handling and lifecycle
 - `context.ts`: none/partial/full snapshots and cooperation instructions
 - `rpc.ts`: JSONL framing, request correlation and process cleanup
 - `tasks.ts`: launch/control/question/completion lifecycle

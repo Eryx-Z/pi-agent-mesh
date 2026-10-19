@@ -10,7 +10,7 @@ import { diagnoseFailure } from "./diagnostics.ts";
 import { SystemdExecutionController, readProcessIdentity, isProcessIdentityAlive, type ExecutionController } from "./execution.ts";
 import { acquireExecutionLease, type ExecutionLease } from "./lease.ts";
 import { isDeepStrictEqual } from "node:util";
-import { effectiveRole, initialRoleLoadout, mergeRoleBaseline, rolePlanDigest, ROLE_CHILD_EXTENSION,
+import { initialRoleLoadout, mergeRoleBaseline, rolePlanDigest, ROLE_CHILD_EXTENSION,
   snapshotRoleLoadout, validateRolePlan, validateRoleSnapshot, type RolePlan, type RoleRun, type RolePreflightResult } from "./role-loadout.ts";
 
 export type NewTask = {
@@ -33,9 +33,11 @@ interface ManagerOptions {
   changed?: () => void; notify?: (record: TaskRecord, kind: "result" | "question") => void;
   /** Tests may shorten delays; production retries are bounded and back off. */
   recoveryDelayMs?: number;
+  /** One absolute role startup/readiness deadline. Tests can shorten it. */
+  roleReadinessMs?: number;
 }
-export function childLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[] = []): RpcLaunch {
-  if (record.version === 3) return roleChildLaunch(record, dir, command, baseArgs);
+export function childLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[] = [], readinessDeadline = Date.now() + 30000): RpcLaunch {
+  if (record.version === 3) return roleChildLaunch(record, dir, command, baseArgs, readinessDeadline);
   const l = validateLoadout(record.loadout);
   const loadoutPath = join(dir, `${record.id}.loadout.json`);
   const promptPath = join(dir, `${record.id}.prompt.md`);
@@ -63,15 +65,12 @@ function newRoleRun(record: Pick<TaskRecord, "id" | "run" | "workflow">, plan: R
 function roleResultPath(record: TaskRecord, dir: string): string {
   return join(dir, `${record.id}.${record.run}.${record.roleRuns!.at(-1)!.binding.nonce}.preflight.json`);
 }
-function roleChildLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[]): RpcLaunch {
+function roleChildLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[], readinessDeadline: number): RpcLaunch {
   const plan = validateRolePlan(record.rolePlan, { access: record.access });
   const run = record.roleRuns!.at(-1)!;
-  const effective = effectiveRole(plan, run.access);
-  // Fail before importing local code or launching resources; MCP belongs to M3.
-  if (effective.mcp.length) throw new Error("Role MCP execution requires M3");
   const runPath = join(dir, `${record.id}.${record.run}.role-run.json`);
   const promptPath = join(dir, `${record.id}.${record.run}.prompt.md`);
-  atomicWrite(runPath, JSON.stringify({ plan, run, resultPath: roleResultPath(record, dir) }));
+  atomicWrite(runPath, JSON.stringify({ plan, run, resultPath: roleResultPath(record, dir), readinessDeadline }));
   atomicWrite(promptPath, `${plan.systemPrompt}\n\n${COOPERATION}`);
   const env = { ...process.env };
   for (const key of Object.keys(env)) if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_RPC_SUBAGENT_") || key === "PI_SESSION_FILE" || key === "PI_SESSION_ID") delete env[key];
@@ -128,6 +127,7 @@ export class TaskManager {
   }
   constructor(readonly store: TaskStore, private options: ManagerOptions) {
     if (!Number.isInteger(options.maxConcurrent ?? 8) || (options.maxConcurrent ?? 8) < 1) throw new Error("maxConcurrent must be a positive integer");
+    if (!Number.isSafeInteger(options.roleReadinessMs ?? 30000) || (options.roleReadinessMs ?? 30000) < 1 || (options.roleReadinessMs ?? 30000) > 30000) throw new Error("roleReadinessMs must be 1–30000 milliseconds");
     for (const record of store.load()) this.records.set(record.id, record);
   }
   assertOwnership(): void {
@@ -236,7 +236,8 @@ export class TaskManager {
       this.assertOwnership();
       if (this.closed) throw new Error("Parent session is shutting down");
       release ??= this.store.lock(record.id);
-      let launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs);
+      const readinessDeadline = record.version === 3 ? Date.now() + (this.options.roleReadinessMs ?? 30000) : undefined;
+      let launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs, readinessDeadline);
       const boundary = this.lease ? this.options.executionController?.prepare(record.id, record.run) : undefined;
       record.execution = boundary ? { boundary, intent: "running", cleanup: "pending" } : undefined;
       this.save(record); // Identity is durable before the launcher can create a scope.
@@ -257,19 +258,26 @@ export class TaskManager {
       rpc.on("closed", detail => {
         if (!live.finishing) void this.finish(record, "failed", `Unexpected child exit: ${detail.code ?? detail.signal}\n${detail.stderr}`, !live.startupPhase);
       });
+      const startupRequest = (type: string, fields?: Record<string, unknown>) => {
+        if (readinessDeadline === undefined) return rpc.request(type, fields);
+        const remaining = readinessDeadline - Date.now();
+        if (remaining <= 0) throw new Error("Role readiness deadline expired");
+        return rpc.request(type, fields, { timeoutMs: remaining + 5000 });
+      };
       phase = live.startupPhase = "RPC readiness";
-      await rpc.request("get_state"); // readiness, not a timed sleep
+      await startupRequest("get_state"); // readiness, not a timed sleep
       this.assertOwnership();
       if (this.closed || live.finishing) throw new Error("Parent session closed during startup");
       if (record.execution) { record.execution.ready = true; this.save(record); }
-      await rpc.request("set_auto_retry", { enabled: false });
+      await startupRequest("set_auto_retry", { enabled: false });
       phase = live.startupPhase = "loadout preflight";
-      const commands = await rpc.request("get_commands");
+      const commands = await startupRequest("get_commands");
       if (!commands?.commands?.some((c: { name: string }) => c.name === "rpc-subagent-preflight")) throw new Error("Child bridge did not load; refusing to send any model prompt");
-      await rpc.request("prompt", { message: "/rpc-subagent-preflight" });
+      await startupRequest("prompt", { message: "/rpc-subagent-preflight" });
       this.assertOwnership();
       if (live.finishing || this.closed) throw new Error("Child failed during preflight");
       if (record.version === 3) {
+        if (Date.now() >= readinessDeadline!) throw new Error("Role readiness deadline expired");
         const run = record.roleRuns!.at(-1)!;
         const result = JSON.parse(readFileSync(roleResultPath(record, this.store.dir), "utf8")) as RolePreflightResult;
         if (!isDeepStrictEqual(result.binding, run.binding)) throw new Error("Role preflight result binding mismatch");
@@ -405,6 +413,12 @@ export class TaskManager {
       // Even a persistence/lease failure must stop this manager's already-owned RPC.
       try {
         let stopError: unknown;
+        // A normal abort does not cancel a pending extension command. Settle the
+        // role readiness command first so RPC can prove its preflight drained.
+        if (record.version === 3 && live.startupPhase && (live.cancelRequested || this.closed) && !live.rpc.exited) {
+          try { await live.rpc.request("prompt", { message: "/rpc-role-cancel-preflight" }, { timeoutMs: 2000 }); }
+          catch { /* The existing stop/boundary proof remains authoritative. */ }
+        }
         try { await live.rpc.stop(); } catch (e) { stopError = e; }
         if (record.execution) await this.confirmBoundary(record, live);
         else if (stopError) throw stopError;

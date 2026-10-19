@@ -9,6 +9,8 @@ import { accessMode, isDelegationTool, nonempty, snapshotSkills, snapshotTool, v
 import { fileURLToPath } from "node:url";
 
 export const ROLE_CHILD_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "role-child.ts");
+export const ROLE_MCP_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "role-mcp.ts");
+export interface RoleMcpSource { server: string; configHash: string; tools: { rawName: string; name: string; definitionHash: string }[] }
 export type RoleToolInfo = ReturnType<ExtensionAPI["getAllTools"]>[number];
 export interface RolePlan {
   version: 1; schemaVersion: 1; roleId: string; manifestPath: string; manifestHash: string;
@@ -24,7 +26,7 @@ export interface RoleBinding { taskId: string; run: number; attemptId: string; n
 export interface RoleToolSnapshot extends ToolSnapshot {
   semanticKind: "builtin" | "local-tool" | "mcp";
   sourceInfo: RoleToolInfo["sourceInfo"];
-  entry?: string; hash?: string; server?: string; remoteName?: string;
+  entry?: string; hash?: string; server?: string; remoteName?: string; configHash?: string; definitionHash?: string;
 }
 export interface RoleSnapshot {
   version: 1; binding: RoleBinding; roleId: string; tools: RoleToolSnapshot[];
@@ -162,6 +164,16 @@ function stable(value: unknown): string {
   return JSON.stringify(value);
 }
 export function rolePlanDigest(plan: RolePlan): string { return digest(stable(validateRolePlan(plan, { resources: false }))); }
+/** Preserve remote metadata absent from Pi ToolInfo (notably outputSchema) across runs. */
+export function roleMcpDefinitionHash(definition: unknown): string { return digest(stable(definition)); }
+export function roleMcpConfigHash(plan: RolePlan, server: string): string {
+  const selected = plan.mcp.find(m => m.server === server);
+  if (!selected) throw new Error(`MCP server is outside the role plan: ${server}`);
+  const config = selected.config;
+  const cwd = config.command !== undefined ? config.cwd ?? plan.cwd : undefined;
+  // Values remain their authored references. Credential rotation never changes identity.
+  return digest(stable({ server, config, ...(cwd !== undefined ? { cwd } : {}) }));
+}
 function skillMetadata(plan: RolePlan): SkillSnapshot[] { return plan.skills.map(({ hash: _hash, ...s }) => clone(s)); }
 export function initialRoleLoadout(plan: RolePlan, access: AccessMode): RoleRuntimeLoadout {
   accessMode(access);
@@ -171,7 +183,7 @@ export function initialRoleLoadout(plan: RolePlan, access: AccessMode): RoleRunt
 }
 export function snapshotRoleLoadout(plan: RolePlan, snapshot: RoleSnapshot): RoleRuntimeLoadout {
   validateRoleSnapshot(snapshot, plan, snapshot.binding, snapshot.effectiveAccess);
-  const toolMetadata = snapshot.tools.map(({ semanticKind: _kind, sourceInfo: _source, entry: _entry, hash: _hash, server: _server, remoteName: _remote, ...t }) => clone(t));
+  const toolMetadata = snapshot.tools.map(({ semanticKind: _kind, sourceInfo: _source, entry: _entry, hash: _hash, server: _server, remoteName: _remote, configHash: _configHash, definitionHash: _definitionHash, ...t }) => clone(t));
   return { ...initialRoleLoadout(plan, snapshot.effectiveAccess), tools: [...toolMetadata.map(t => t.name), "ask_question"], toolMetadata,
     extensions: [...new Set(toolMetadata.filter(t => t.source === "extension").map(t => t.path))], skills: clone(snapshot.skills) };
 }
@@ -200,30 +212,39 @@ function checkTool(t: RoleToolSnapshot, plan: RolePlan, access: AccessMode): voi
   if (t.semanticKind === "builtin") {
     if (!effective.builtinTools.includes(t.name) || t.source !== "builtin" || t.sourceInfo.source !== "builtin" ||
         ![`builtin:${t.name}`, `<builtin:${t.name}>`].includes(t.sourceInfo.path) || t.entry !== undefined || t.hash !== undefined ||
-        t.server !== undefined || t.remoteName !== undefined) throw new Error(`Builtin provenance mismatch: ${t.name}`);
+        t.server !== undefined || t.remoteName !== undefined || t.configHash !== undefined || t.definitionHash !== undefined) throw new Error(`Builtin provenance mismatch: ${t.name}`);
   } else if (t.semanticKind === "local-tool") {
     const entry = effective.extraTools.find(e => e.entry === t.entry && e.tools.includes(t.name));
     if (!entry || entry.hash !== t.hash || t.source !== "extension" || ["builtin", "sdk", "inline"].includes(t.sourceInfo.source) ||
-        t.sourceInfo.path !== t.path || ![ROLE_CHILD_EXTENSION, entry.entry].includes(t.path) || t.server !== undefined || t.remoteName !== undefined) throw new Error(`Local tool provenance mismatch: ${t.name}`);
-  } else {
-    // M3 owns native MCP discovery/provenance. No guessed source identity is safe in M2.
-    throw new Error(`Unsupported MCP or invalid role tool kind: ${t.name}`);
-  }
+        t.sourceInfo.path !== t.path || ![ROLE_CHILD_EXTENSION, entry.entry].includes(t.path) || t.server !== undefined || t.remoteName !== undefined || t.configHash !== undefined || t.definitionHash !== undefined) throw new Error(`Local tool provenance mismatch: ${t.name}`);
+  } else if (t.semanticKind === "mcp") {
+    const selected = effective.mcp.find(m => m.server === t.server && m.tools.includes(t.remoteName ?? ""));
+    hash(t.definitionHash, "MCP definition");
+    if (!selected || t.configHash !== roleMcpConfigHash(plan, selected.server) || t.source !== "extension" ||
+        ["builtin", "sdk", "inline"].includes(t.sourceInfo.source) || t.path !== ROLE_CHILD_EXTENSION || t.sourceInfo.path !== t.path ||
+        t.namespace?.name !== `mcp__${selected.server.replace(/-/g, "_")}` || t.entry !== undefined || t.hash !== undefined) {
+      throw new Error(`MCP tool provenance/configuration mismatch: ${t.name}`);
+    }
+  } else throw new Error(`Invalid role tool kind: ${t.name}`);
 }
-function expectedNames(plan: RolePlan, access: AccessMode): string[] {
+function expectedNames(plan: RolePlan, access: AccessMode, tools: RoleToolSnapshot[]): string[] {
   const e = effectiveRole(plan, access);
-  if (e.mcp.some(m => m.tools.length)) throw new Error("MCP role execution requires M3");
-  return [...e.builtinTools, ...e.extraTools.flatMap(t => t.tools)];
+  const remote = e.mcp.flatMap(m => m.tools.map(raw => {
+    const found = tools.filter(t => t.semanticKind === "mcp" && t.server === m.server && t.remoteName === raw);
+    if (found.length !== 1) throw new Error(`Missing or duplicate required MCP tool: ${m.server}/${raw}`);
+    return found[0].name;
+  }));
+  return [...e.builtinTools, ...e.extraTools.flatMap(t => t.tools), ...remote];
 }
 function checkInventory(plan: RolePlan, access: AccessMode, tools: RoleToolSnapshot[]): void {
   const seen = new Set<string>();
   for (const t of tools) { if (seen.has(t.name)) throw new Error(`Duplicate role tool: ${t.name}`); seen.add(t.name); checkTool(t, plan, access); }
-  const expected = expectedNames(plan, access);
+  const expected = expectedNames(plan, access, tools);
   if (expected.length !== seen.size || expected.some(n => !seen.has(n))) throw new Error("Role tool inventory is missing required tools or contains unexpected tools");
 }
 /** Verify the actual Pi inventory, never parent active tools. Entries identify original
  * trusted code; sourceInfo identifies the extension that registered its copied wrapper. */
-export function snapshotRoleTools(plan: RolePlan, access: AccessMode, tools: RoleToolInfo[], localSources: RoleLocalSource[] = []): RoleToolSnapshot[] {
+export function snapshotRoleTools(plan: RolePlan, access: AccessMode, tools: RoleToolInfo[], localSources: RoleLocalSource[] = [], mcpSources: RoleMcpSource[] = []): RoleToolSnapshot[] {
   validateRolePlan(plan, { access });
   const seen = new Set<string>();
   for (const t of tools) { if (seen.has(t.name)) throw new Error(`Duplicate actual role tool: ${t.name}`); seen.add(t.name); }
@@ -232,6 +253,16 @@ export function snapshotRoleTools(plan: RolePlan, access: AccessMode, tools: Rol
   checkBridge({ ...snapshotTool(q), sourceInfo: q.sourceInfo });
   const effective = effectiveRole(plan, access);
   if (!isDeepStrictEqual(localSources, effective.extraTools)) throw new Error("Local tool source mapping does not match the role plan");
+  const servers = new Map<string, string[]>();
+  for (const selected of effective.mcp) servers.set(selected.server, [...(servers.get(selected.server) ?? []), ...selected.tools]);
+  if (servers.size !== mcpSources.length || new Set(mcpSources.map(s => s.server)).size !== mcpSources.length) throw new Error("Incomplete or duplicate MCP source mapping");
+  for (const source of mcpSources) {
+    const rawNames = servers.get(source.server);
+    if (!rawNames || source.configHash !== roleMcpConfigHash(plan, source.server) || source.tools.length !== rawNames.length ||
+        new Set(source.tools.map(t => t.rawName)).size !== rawNames.length || source.tools.some(t => !rawNames.includes(t.rawName) || typeof t.name !== "string" || !t.name || !/^[a-f0-9]{64}$/.test(t.definitionHash))) {
+      throw new Error("MCP source mapping does not match the role plan");
+    }
+  }
   const snapshots: RoleToolSnapshot[] = [];
   for (const t of tools) {
     if (t.name === "ask_question") continue;
@@ -240,12 +271,16 @@ export function snapshotRoleTools(plan: RolePlan, access: AccessMode, tools: Rol
     // ignoring them; never hide an extension that substituted a builtin name.
     if (metadata.source === "builtin" && !effective.builtinTools.includes(t.name)) continue;
     const local = localSources.find(e => e.tools.includes(t.name));
-    snapshots.push(clone({ ...metadata, semanticKind: local ? "local-tool" as const : "builtin" as const, sourceInfo: t.sourceInfo,
-      ...(local ? { entry: local.entry, hash: local.hash } : {}) }));
+    const remoteSources = mcpSources.flatMap(source => source.tools.filter(tool => tool.name === t.name).map(tool => ({ source, tool })));
+    if (remoteSources.length > 1 || local && remoteSources.length) throw new Error(`Duplicate role tool identity: ${t.name}`);
+    const remote = remoteSources[0];
+    snapshots.push(clone({ ...metadata, semanticKind: local ? "local-tool" as const : remote ? "mcp" as const : "builtin" as const, sourceInfo: t.sourceInfo,
+      ...(local ? { entry: local.entry, hash: local.hash } : {}),
+      ...(remote ? { server: remote.source.server, remoteName: remote.tool.rawName, configHash: remote.source.configHash, definitionHash: remote.tool.definitionHash } : {}) }));
   }
   checkInventory(plan, access, snapshots);
   // Persist declaration order, independent of host inventory ordering.
-  return expectedNames(plan, access).map(n => snapshots.find(t => t.name === n)!);
+  return expectedNames(plan, access, snapshots).map(n => snapshots.find(t => t.name === n)!);
 }
 function checkBinding(binding: RoleBinding): void {
   object(binding, "role binding");

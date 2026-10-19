@@ -20,15 +20,17 @@ function fixture(t: { after(fn: () => void | Promise<void>): void }, alter: (val
     model: "fake/test", thinking: "off", context: "none", access: "full", cwd: dir, agentDir: dir };
   const store = new TaskStore(join(dir, "tasks"));
   const prompts: string[] = [];
+  const requests: { type: string; message?: string; timeoutMs?: number }[] = [];
   let changed: (() => void) | undefined;
   let schemaChange = false;
   let stopFails = false;
   const rpc = new EventEmitter() as any;
   rpc.stop = async () => { if (stopFails) throw new Error("Shutdown unconfirmed"); };
-  rpc.request = async (type: string, fields: any) => {
+  rpc.request = async (type: string, fields: any, options?: { timeoutMs?: number }) => {
+    requests.push({ type, message: fields?.message, timeoutMs: options?.timeoutMs });
     if (type === "get_state") return { isStreaming: true, isCompacting: false, pendingMessageCount: 0 };
     if (type === "get_commands") return { commands: [{ name: "rpc-subagent-preflight" }] };
-    if (type !== "prompt") return;
+    if (type !== "prompt" || fields.message === "/rpc-role-cancel-preflight") return;
     prompts.push(fields.message);
     if (fields.message === "/rpc-subagent-preflight") {
       const input = JSON.parse(readFileSync(rpc.launch.env.PI_RPC_SUBAGENT_ROLE_RUN, "utf8"));
@@ -53,7 +55,7 @@ function fixture(t: { after(fn: () => void | Promise<void>): void }, alter: (val
   };
   const manager = new TaskManager(store, { command: "unused", changed: () => changed?.(), createRpc: launch => { rpc.launch = launch; return rpc; } });
   t.after(async () => { stopFails = false; await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); });
-  return { dir, plan, store, manager, rpc, prompts, onChange: (fn: () => void) => changed = fn, changeSchema: () => schemaChange = true, failStop: () => stopFails = true };
+  return { dir, plan, store, manager, rpc, prompts, requests, onChange: (fn: () => void) => changed = fn, changeSchema: () => schemaChange = true, failStop: () => stopFails = true };
 }
 for (const [name, alter] of [
   ["missing sidecar", () => undefined],
@@ -78,6 +80,10 @@ for (const [name, alter] of [
 test("role snapshot and baseline are durable before model submission; mismatch cannot partially update history", async t => {
   const f = fixture(t);
   const record = await f.manager.launch({ task: "original", access: "full", context: "none", rolePlan: f.plan });
+  for (const request of f.requests.filter(r => r.type !== "prompt" || r.message === "/rpc-subagent-preflight")) {
+    assert.ok(request.timeoutMs! > 15000 && request.timeoutMs! <= 35000, "Role startup uses remaining 30s deadline + 5s margin, not legacy 15s timeout");
+  }
+  assert.equal(f.requests.find(r => r.message?.includes("Assigned task:"))!.timeoutMs, undefined, "Only readiness gets the extended RPC budget");
   await f.manager.cancel(record.id);
   const baseline = structuredClone(record.roleBaseline), snapshot = structuredClone(record.roleRuns![0].snapshot);
   f.changeSchema();

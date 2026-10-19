@@ -55,11 +55,10 @@ test("role bridge freezes tools only after private atomic bound preflight, recor
 test("preflight skill/model failures write bound error without enabling tools",async()=>{
   const f=fixture();try{const b=await boot(f);b.ctx.model.id="other";await b.preflight();assert.deepEqual(b.result().binding,f.run.binding);assert.match(b.result().error,/model|selected/i);assert.deepEqual(b.active(),[]);}finally{f.clean();}
 });
-test("full MCP fails explicitly before importing local tools; read-only skips both",async()=>{
+test("read-only skips both declared local tools and MCP before loading either",async()=>{
   const f=fixture();try{
     const entry=join(f.dir,"must-not-run.mjs");const source="throw new Error('LOCAL WAS IMPORTED'); export default ()=>{};";writeFileSync(entry,source);
     f.plan.extraTools=[{entry,hash:hash(source),tools:["selected"]}];f.plan.mcp=[{server:"test",config:{command:"never"},tools:["remote"]}];f.run.binding.planHash=rolePlanDigest(f.plan);
-    const full=await boot(f);await full.preflight();assert.match(full.result().error,/MCP.*M3|M3.*MCP/i);assert.doesNotMatch(full.result().error,/LOCAL WAS IMPORTED/);
     const ro=await boot(f,"read-only");await ro.preflight();assert.ok(ro.result().snapshot);assert.deepEqual(ro.active(),["read","ask_question"]);
   }finally{f.clean();}
 });
