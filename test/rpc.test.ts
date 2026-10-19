@@ -32,6 +32,26 @@ test("RPC timeout is explicit and stops the child, rejecting outstanding request
   await r.stop();
   await assert.rejects(r.request("get_state"), /stopping/);
 });
+test("per-request timeout can extend preflight without changing ordinary request deadlines", async () => {
+  const r = rpc(250);
+  try {
+    await r.request("get_state", {}, { timeoutMs: 5000 });
+    const result = await r.request("echo", { value: "ready", delay: 600 }, { timeoutMs: 2000 });
+    assert.equal(result.value, "ready");
+    await assert.rejects(r.request("echo", { delay: 600 }), /timed out.*unknown/);
+    await r.stop();
+    assert.equal(r.exited, true);
+  } finally { await r.stop().catch(() => {}); }
+});
+test("per-request timeout rejects invalid deadlines without submitting or stopping the child", async () => {
+  const r = rpc();
+  try {
+    for (const timeoutMs of [0, -1, NaN, Infinity, 2147483648]) {
+      await assert.rejects(r.request("echo", {}, { timeoutMs }), /timeoutMs/);
+    }
+    assert.equal((await r.request("echo", { value: "still alive" })).value, "still alive");
+  } finally { await r.stop(); }
+});
 test("unexpected child exit rejects pending requests; shutdown is idempotent", async () => {
   const r = rpc();
   await assert.rejects(r.request("die"), /closed/);

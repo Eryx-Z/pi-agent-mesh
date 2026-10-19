@@ -3,7 +3,7 @@ import { existsSync, readFileSync } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { RpcProcess, type RpcEvent, type RpcLaunch } from "./rpc.ts";
 import { CHILD_EXTENSION, validateLoadout, applyAccess, accessMode, type AccessMode, type Loadout } from "./loadout.ts";
-import { atomicWrite, addLog, bounded, uniqueName, TaskStore, type TaskRecord } from "./store.ts";
+import { atomicWrite, addLog, bounded, uniqueName, terminal, TaskStore, type TaskRecord } from "./store.ts";
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
 import { diagnoseFailure } from "./diagnostics.ts";
@@ -84,7 +84,15 @@ export class TaskManager {
       manager = new TaskManager(store, { ...options, executionController: options.executionController ?? new SystemdExecutionController() });
       manager.lease = lease;
       atomicWrite(path, JSON.stringify({ identity, active: true }));
-      for (const record of manager.records.values()) if (record.recovery) store.save(record);
+      for (const record of manager.records.values()) {
+        if (record.recovery) store.save(record);
+        // completeCleanup may have persisted its proof before crashing on lock deletion.
+        // Only this leased owner may finish that idempotent release; stopped alone is not proof.
+        if (record.stopped && terminal(record.state) && record.execution?.cleanup === "confirmed") {
+          manager.assertOwnership();
+          store.lock(record.id, true)();
+        }
+      }
       return manager;
     } catch (error) { await lease.release(); throw error; }
   }
@@ -353,12 +361,12 @@ export class TaskManager {
       throw new Error("Execution boundary is empty but launcher exit is not yet confirmed");
     }
   }
-  private completeCleanup(record: TaskRecord, live?: LiveRun): void {
+  private completeCleanup(record: TaskRecord, live?: LiveRun, announce = true): void {
     record.stopped = true; record.recovery = undefined;
     if (record.error === "Interrupted execution; automatic cleanup pending") record.error = "Previous execution interrupted; cleanup confirmed";
     if (record.execution) record.execution.cleanup = "confirmed";
     record.activity = record.state;
-    this.save(record);
+    this.save(record, announce);
     if (live) { live.release(); this.live.delete(record.id); }
     else this.store.lock(record.id, true)(); // Leased directory + confirmed boundary, no stale-unlink race.
   }
@@ -393,19 +401,36 @@ export class TaskManager {
         record.activity = "automatically cleaning previous execution";
         this.save(record);
         try {
-          if (!record.stopped) await this.confirmBoundary(record, live);
+          if (!record.stopped || record.execution.cleanup !== "confirmed") await this.confirmBoundary(record, live);
           if (record.execution.intent !== "interrupted") record.state = record.execution.intent;
-          this.completeCleanup(record, live);
+          // Do not expose a cleared recovery guard to synchronous subscribers before
+          // lock release and either waiting-state or continuation-slot reservation.
+          this.completeCleanup(record, live, false);
           if (record.execution.intent === "interrupted" && !record.workflow && !this.closed && (record.recoveryRuns ?? 0) < 1) {
+            if (!this.hasCapacity()) {
+              // Cleanup frees this writer's slot, but other cleanup/runs may still fill
+              // capacity. Waiting is not a submission and must not consume its budget.
+              record.recovery = { phase: "cleaning", attempts: 0 };
+              record.activity = "automatic continuation waiting for capacity";
+              this.save(record);
+              continue;
+            }
             record.recoveryRuns = (record.recoveryRuns ?? 0) + 1;
             record.recovery = { phase: "resuming", attempts: 0 };
-            this.save(record); // Reserve the attempt durably before any new prompt.
+            // No listeners between the capacity check and continue's synchronous slot
+            // reservation: a reentrant launch must not steal capacity after budget use.
+            this.save(record, false); // Reserve the attempt durably before any new prompt.
             await this.continue(record.id,
               `Recover the interrupted task using the retained session history. First inspect existing results and partial tool effects. Do not blindly repeat side effects or treat interruption as rollback. Keep all original restrictions and finish only remaining work. Original task:\n${record.task}` +
                 (record.continuationTask ? `\nLatest continuation instruction (takes precedence):\n${record.continuationTask}` : "") +
                 (record.supplementaryInstructions?.length ? `\nSupplementary instructions submitted by the parent (receipt/execution may be unknown):\n${record.supplementaryInstructions.join("\n\n")}` : ""),
               record.access, undefined, true);
-          } else if (!this.closed) this.options.notify?.(record, "result");
+          } else if (!this.closed) {
+            // Terminal/workflow listeners still need the cleanup transition, but only
+            // after its old lock is gone. A listener may explicitly start a new run.
+            this.save(record);
+            if (record.run === run && record.stopped) this.options.notify?.(record, "result");
+          }
         } catch (error) {
           if (this.closed) break;
           if (record.run !== run) continue; // The replacement run owns its own cleanup/outcome now.

@@ -97,9 +97,15 @@ export class RpcProcess extends EventEmitter {
       throw error;
     }
   }
-  request(type: string, fields: Record<string, unknown> = {}): Promise<any> {
+  request(type: string, fields: Record<string, unknown> = {}, options: { timeoutMs?: number } = {}): Promise<any> {
     if (this.closed || this.stopRequested) return Promise.reject(new Error("RPC process is stopping"));
-    return this.requestWithTimeout(type, fields, this.timeoutMs, true);
+    // Role readiness uses its remaining absolute deadline plus communication margin.
+    // Do not change the 15s default or the conservative timeout/cleanup semantics.
+    const timeoutMs = options.timeoutMs ?? this.timeoutMs;
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0 || timeoutMs > 2147483647) {
+      return Promise.reject(new Error("timeoutMs must be positive, finite, and within the Node timer range"));
+    }
+    return this.requestWithTimeout(type, fields, timeoutMs, true);
   }
   private requestWithTimeout(type: string, fields: Record<string, unknown>, timeoutMs: number, stopOnTimeout: boolean): Promise<any> {
     const id = randomUUID();

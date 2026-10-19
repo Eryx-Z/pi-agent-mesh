@@ -31,7 +31,9 @@ async function setup(cleanup: ExecutionController['cleanup'] = async () => {}) {
   assert.ok(identity);
   const boundary = { kind: 'systemd-scope' as const, unit: `pi-execution-${randomUUID()}.scope`, bootId: identity.bootId, uid: process.getuid!() };
   let starts = 0;
+  const rpcs: RpcProcess[] = [];
   const prompts: string[] = [];
+  const notifications: { id: string; run: number; kind: string }[] = [];
   const controller: ExecutionController = {
     prepare: () => ({ ...boundary, unit: `pi-execution-${randomUUID()}.scope` }),
     wrap: launch => launch, cleanup,
@@ -51,17 +53,20 @@ async function setup(cleanup: ExecutionController['cleanup'] = async () => {}) {
     store.save(record); writeFileSync(`${store.path(id)}.lock`, JSON.stringify({ token: 'stale', pid: child.pid }));
     return record;
   }
-  async function open(recoveryDelayMs = 10) {
+  async function open(recoveryDelayMs = 10, maxConcurrent = 8) {
     const manager = await TaskManager.open(store, {
-      command: process.execPath, executionController: controller, recoveryDelayMs,
+      command: process.execPath, executionController: controller, recoveryDelayMs, maxConcurrent,
+      notify: (record, kind) => notifications.push({ id: record.id, run: record.run, kind }),
       createRpc: launch => {
         starts++;
-        const persisted = store.load().find(record => !record.stopped);
-        if (persisted?.run === 2) {
+        assert.ok(rpcs.filter(rpc => !rpc.exited).length < maxConcurrent, 'Previous RPC must exit before reusing capacity');
+        const persisted = store.load().find(record => record.sessionFile === launch.args[launch.args.indexOf('--session') + 1]);
+        if (persisted?.run === 2 && persisted.recoveryRuns !== 0) {
           assert.equal(persisted.recoveryRuns, 1, 'Reserve recovery durably before launching its RPC');
           assert.ok(existsSync(persisted.sessionFile), 'Retain session before recovery launch');
         }
         const rpc = new RpcProcess({ ...launch, args: [fake] }, 1000, 100);
+        rpcs.push(rpc);
         const request = rpc.request.bind(rpc);
         rpc.request = (type, fields) => {
           if (type === 'prompt' && typeof fields?.message === 'string') prompts.push(fields.message);
@@ -72,7 +77,7 @@ async function setup(cleanup: ExecutionController['cleanup'] = async () => {}) {
     });
     managers.push(manager); return manager;
   }
-  return { dir, store, seed, open, prompts, get starts() { return starts; },
+  return { dir, store, seed, open, prompts, notifications, get starts() { return starts; },
     async clean() { for (const manager of managers) await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); } };
 }
 
@@ -92,6 +97,152 @@ test('automatic cleanup retries failure, preserves terminal result and only then
     assert.equal(t.starts, 0); assert.equal(existsSync(`${t.store.path(old.id)}.lock`), false);
     t.store.lock(old.id)();
   } finally { release(); await t.clean(); }
+});
+
+for (const intent of ['completed', 'failed', 'cancelled'] as const) {
+  test(`confirmed stopped ${intent} crash checkpoint reclaims stale lock only under owner lease`, linux, async () => {
+    let calls = 0;
+    const t = await setup(async () => { calls++; });
+    try {
+      const old = t.seed('completed'); old.state = intent; old.stopped = true;
+      old.execution!.intent = intent; old.execution!.cleanup = 'confirmed'; t.store.save(old);
+      // Reproduce the durable checkpoint between completeCleanup's save and lock deletion.
+      const unleased = new TaskManager(t.store, { command: process.execPath });
+      unleased.startRecovery();
+      assert.throws(() => t.store.lock(old.id), /locked/);
+      const manager = await t.open(); manager.startRecovery();
+      await until(() => !existsSync(`${t.store.path(old.id)}.lock`));
+      assert.equal(calls, 0); assert.equal(t.starts, 0);
+      assert.equal(manager.get(old.id).state, intent); assert.equal(manager.get(old.id).output, old.output);
+      t.store.lock(old.id)();
+      manager.startRecovery(); await sleep(40);
+      await manager.shutdown(); const reopened = await t.open(); reopened.startRecovery(); await sleep(40);
+      assert.equal(t.starts, 0); assert.equal(calls, 0);
+      assert.equal(existsSync(`${t.store.path(old.id)}.lock`), false);
+    } finally { await t.clean(); }
+  });
+}
+
+for (const proof of ['pending', 'missing'] as const) {
+  test(`stopped terminal record with ${proof} cleanup proof never reclaims lock`, linux, async () => {
+    let calls = 0;
+    const t = await setup(async () => { calls++; throw new Error('Cleanup is not confirmed'); });
+    try {
+      const old = t.seed('completed'); old.stopped = true;
+      if (proof === 'missing') delete old.execution;
+      t.store.save(old);
+      const manager = await t.open(); manager.startRecovery(); await sleep(60);
+      assert.throws(() => t.store.lock(old.id), /locked/);
+      assert.equal(t.starts, 0); assert.equal(calls, 0);
+    } finally { await t.clean(); }
+  });
+}
+
+test('three interrupted tasks wait for capacity without consuming recovery budget or overlapping RPCs', linux, async () => {
+  const t = await setup();
+  try {
+    const old = [t.seed(), t.seed(), t.seed()];
+    for (const record of old) { record.task = 'SCENARIO_HOLD'; t.store.save(record); }
+    const manager = await t.open(10, 1); manager.startRecovery(); manager.startRecovery();
+    const records = old.map(record => manager.get(record.id));
+    for (let i = 0; i < records.length; i++) {
+      await until(() => t.starts === i + 1 && records.filter(record => manager.isLive(record.id)).length === 1);
+      const running = records.find(record => manager.isLive(record.id))!;
+      await until(() => t.prompts.filter(prompt => prompt.includes('Recover the interrupted task')).length === i + 1);
+      await sleep(60); manager.startRecovery(); await sleep(40);
+      assert.equal(t.starts, i + 1, 'Repeated recovery ticks must not duplicate submission');
+      for (const waiting of records.filter(record => record.run === 1)) {
+        assert.equal(waiting.stopped, true); assert.equal(waiting.execution?.cleanup, 'confirmed');
+        assert.equal(waiting.recoveryRuns ?? 0, 0); assert.equal(waiting.recovery?.phase, 'cleaning');
+        assert.equal(JSON.parse(readFileSync(t.store.path(waiting.id), 'utf8')).recoveryRuns ?? 0, 0);
+      }
+      await manager.message(running.id, 'finish remaining work');
+      await until(() => running.stopped);
+    }
+    assert.equal(t.starts, 3);
+    for (const record of records) {
+      assert.equal(record.run, 2); assert.equal(record.recoveryRuns, 1); assert.equal(record.state, 'completed');
+    }
+    manager.startRecovery(); await sleep(50); assert.equal(t.starts, 3);
+    await manager.shutdown(); const reopened = await t.open(10, 1); reopened.startRecovery(); await sleep(50);
+    assert.equal(t.starts, 3);
+  } finally { await t.clean(); }
+});
+
+test('capacity-waiter cleanup never exposes an unguarded continuation or removes a replacement lock', linux, async () => {
+  const t = await setup();
+  try {
+    const old = [t.seed(), t.seed()];
+    for (const record of old) { record.task = 'SCENARIO_HOLD'; t.store.save(record); }
+    const manager = await t.open(10, 1); manager.startRecovery();
+    const records = old.map(record => manager.get(record.id));
+    await until(() => t.starts === 1 && records.some(record => record.activity === 'automatic continuation waiting for capacity'));
+    await until(() => t.prompts.some(prompt => prompt.includes('Recover the interrupted task')));
+    const waiting = records.find(record => record.run === 1)!;
+    const running = records.find(record => record.run === 2)!;
+    let reentrant: Promise<TaskRecord> | undefined;
+    const unsubscribe = manager.subscribe(() => {
+      // A UI/workflow subscriber is allowed to synchronously invoke public controls.
+      if (!reentrant && waiting.run === 1 && waiting.stopped && !waiting.recovery && manager.hasCapacity()) {
+        reentrant = manager.continue(waiting.id, 'SCENARIO_HOLD', 'full');
+        void reentrant.catch(() => {});
+      }
+    });
+    try {
+      await manager.message(running.id, 'finish remaining work');
+      await until(() => waiting.run === 2 && manager.isLive(waiting.id));
+      if (reentrant) await reentrant;
+      assert.throws(() => t.store.lock(waiting.id), /locked/, 'Replacement must retain its task lock');
+      assert.equal(reentrant, undefined, 'Automatic recovery must not expose a cleared guard before slot reservation');
+      assert.equal(waiting.recoveryRuns, 1);
+      assert.equal(t.notifications.some(n => n.id === waiting.id && n.run === 2), false, 'Running replacement must not be announced as a result');
+      await manager.cancel(waiting.id);
+    } finally { unsubscribe(); }
+  } finally { await t.clean(); }
+});
+
+test('cancelling a capacity-waiting recovery preserves its unused budget and prevents later submission', linux, async () => {
+  const t = await setup();
+  try {
+    const old = [t.seed(), t.seed()];
+    for (const record of old) { record.task = 'SCENARIO_HOLD'; t.store.save(record); }
+    const manager = await t.open(10, 1); manager.startRecovery();
+    const records = old.map(record => manager.get(record.id));
+    await until(() => t.starts === 1 && records.some(record => record.activity === 'automatic continuation waiting for capacity'));
+    await until(() => t.prompts.some(prompt => prompt.includes('Recover the interrupted task')));
+    const waiting = records.find(record => record.run === 1)!;
+    const running = records.find(record => record.run === 2)!;
+    await manager.cancel(waiting.id);
+    const durable = JSON.parse(readFileSync(t.store.path(waiting.id), 'utf8'));
+    assert.equal(durable.execution.intent, 'cancelled'); assert.equal(durable.recoveryRuns ?? 0, 0);
+    assert.equal(durable.stopped, true); assert.equal(durable.recovery, undefined);
+    await manager.message(running.id, 'finish remaining work'); await until(() => running.stopped);
+    manager.startRecovery(); await sleep(80);
+    assert.equal(t.starts, 1); assert.equal(waiting.run, 1);
+    await manager.shutdown(); const reopened = await t.open(10, 1); reopened.startRecovery(); await sleep(80);
+    assert.equal(t.starts, 1); assert.equal(reopened.get(waiting.id).state, 'cancelled');
+  } finally { await t.clean(); }
+});
+
+test('shutdown fences capacity-waiting recovery without consuming its budget', linux, async () => {
+  const t = await setup();
+  try {
+    const old = [t.seed(), t.seed()];
+    for (const record of old) { record.task = 'SCENARIO_HOLD'; t.store.save(record); }
+    const manager = await t.open(10, 1); manager.startRecovery();
+    const records = old.map(record => manager.get(record.id));
+    await until(() => t.starts === 1 && records.some(record => record.activity === 'automatic continuation waiting for capacity'));
+    const waiting = records.find(record => record.run === 1)!;
+    await until(() => t.prompts.some(prompt => prompt.includes('Recover the interrupted task')));
+    manager.fenceRecovery(); manager.startRecovery(); await manager.shutdown(); await sleep(60);
+    assert.equal(t.starts, 1); assert.equal(waiting.recoveryRuns ?? 0, 0);
+    assert.equal(waiting.run, 1); assert.equal(waiting.stopped, true);
+    const reopened = await t.open(10, 1); reopened.startRecovery();
+    await until(() => t.starts === 2 && reopened.isLive(waiting.id));
+    await until(() => t.prompts.filter(prompt => prompt.includes('Recover the interrupted task')).length === 2);
+    assert.equal(reopened.get(waiting.id).recoveryRuns, 1);
+    await reopened.cancel(waiting.id);
+  } finally { await t.clean(); }
 });
 
 test('interrupted task resumes exactly once with retained history and durable attempt reservation', linux, async () => {
