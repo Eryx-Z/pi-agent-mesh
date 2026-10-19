@@ -3,10 +3,11 @@ import assert from "node:assert/strict";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import { RpcProcess } from "../pi-extension/subagents/rpc.ts";
-import { startRoleMcpPeer } from "./fixtures/role-mcp-peer.ts";
+import { startRoleMcpPeer, roleMcpServerPath } from "./fixtures/role-mcp-peer.ts";
 import { TaskStore } from "../pi-extension/subagents/store.ts";
 import { loadout } from "./fixtures/loadout.ts";
 const pkg = getPackageDir(), cli = join(pkg, JSON.parse(readFileSync(join(pkg, "package.json"), "utf8")).bin.pi);
@@ -20,8 +21,13 @@ function fixture(t: TestContext) {
   const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent"), PI_AGENT_MESH_CONFIG: "", PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ROLE_TEAM_LOG: log };
   for (const key of Object.keys(env)) if (key.startsWith("PI_RPC_SUBAGENT_") || key.startsWith("PI_SUBAGENT_")) delete env[key];
   const events: any[] = []; const processes: RpcProcess[] = [];
-  const open = (extensions: string[] = [], extra: string[] = [], nativeDefaults = false) => {
-    const rpc = new RpcProcess({ command: process.execPath, cwd: dir, env, args: [cli, "--mode", "rpc", "--session", session, ...(nativeDefaults ? [] : ["--no-extensions"]), "--no-skills", "--no-context-files", "--no-prompt-templates", "--approve", "--model", "role-team-fixture/pm", "--thinking", "off", "-e", provider, "-e", entry, ...extensions.flatMap(e => ["-e", e]), ...extra] });
+  const open = (extensions: string[] = [], extra: string[] = [], nativeDefaults = false, source?: "settings" | "package" | "project-settings" | "project-package") => {
+    if (source) {
+      mkdirSync(env.PI_CODING_AGENT_DIR!, { recursive: true });
+      const directory = source.startsWith("project-") ? join(dir, ".pi") : env.PI_CODING_AGENT_DIR!;
+      writeFileSync(join(directory, "settings.json"), JSON.stringify(source.endsWith("settings") ? { extensions: [entry] } : { packages: [fileURLToPath(new URL("../", import.meta.url))] }));
+    }
+    const rpc = new RpcProcess({ command: process.execPath, cwd: dir, env, args: [cli, "--mode", "rpc", "--session", session, ...(nativeDefaults || source ? [] : ["--no-extensions"]), "--no-skills", "--no-context-files", "--no-prompt-templates", "--approve", "--model", "role-team-fixture/pm", "--thinking", "off", "-e", provider, ...(source ? [] : ["-e", entry]), ...extensions.flatMap(e => ["-e", e]), ...extra] });
     rpc.on("event", event => events.push(event)); processes.push(rpc); return rpc;
   };
   t.after(async () => { await Promise.allSettled(processes.map(rpc => rpc.stop())); rmSync(dir, { recursive: true, force: true }); });
@@ -47,8 +53,13 @@ function seedRecovery(f: ReturnType<typeof fixture>) {
   }
 }
 function records(dir: string, suffix = "") : any[] {
-  if (!existsSync(dir)) return [];
-  return readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? records(join(dir, e.name), suffix) : /^[a-f0-9-]{36}\.json$/.test(e.name) ? [JSON.parse(readFileSync(join(dir, e.name), "utf8"))] : []);
+  try {
+    return readdirSync(dir, { withFileTypes: true }).flatMap(e => e.isDirectory() ? records(join(dir, e.name), suffix) : /^[a-f0-9-]{36}\.json$/.test(e.name) ? [JSON.parse(readFileSync(join(dir, e.name), "utf8"))] : []);
+  } catch (error) {
+    // Native settings locks/worktree directories can disappear during this walk.
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+    throw error;
+  }
 }
 
 for (const fails of [false, true]) test(`PM readiness gates actual recovery results and worker questions (failed=${fails})`, { timeout: 25000 }, async t => {
@@ -167,6 +178,127 @@ test("a packaged custom role with a new ID dispatches its selected local tool wi
   assert.equal(child.state, "completed", child.error); assert.match(child.output, /Hello, Ada!/); assert.equal(child.context, "none");
   assert.deepEqual(child.loadout.tools, ["read", "greet", "ask_question"]);
   assert.equal(f.events.some(e => e.type === "extension_error"), false, JSON.stringify(f.events));
+});
+
+test("no-role children inherit selected PM local implementations only at full access", { timeout: 30000 }, async t => {
+  const f = fixture(t), imported = join(f.dir, "local-imports");
+  writeFileSync(join(f.dir, ".pi/tool.mjs"), `import {appendFileSync} from 'node:fs'; appendFileSync(${JSON.stringify(imported)}, 'imported\\n'); export default pi => pi.registerTool({name:'pm_local',label:'Local',description:'PM selected local',parameters:{type:'object',properties:{}},async execute(){return {content:[{type:'text',text:'PM_INHERITED_LOCAL_OK'}],details:{}}}});`);
+  writeFileSync(f.role, 'schema_version: 1\nid: pm\ndescription: PM local\nsystem_prompt: ./pm.md\nbuiltin_tools: [read]\nextra_tools: [{entry: ./tool.mjs, tools: [pm_local]}]\ndefaults: {access: full}\n');
+  const rpc = f.open();
+  for (const access of ["full", "read-only"] as const) {
+    const name = `inherit-local-${access}`;
+    await call(rpc, "subagent", { name, access, context: "none", task: access === "full" ? 'CALL {"name":"pm_local","arguments":{}}' : "CHILD_INSPECT" });
+    await idle(rpc, () => records(f.dir).some(r => r.name === name && r.stopped));
+    const child = records(f.dir).find(r => r.name === name);
+    assert.equal(child.state, "completed", child.error);
+    assert.equal(child.version, 2, "A no-role child must retain the inherited execution path, not impersonate a role");
+    if (access === "full") {
+      assert.match(child.output, /PM_INHERITED_LOCAL_OK/);
+      assert.equal(child.loadout.toolMetadata.find((tool: any) => tool.name === "pm_local").path, entry);
+    } else {
+      assert.deepEqual(child.loadout.tools, ["read", "ask_question"]);
+      assert.deepEqual(child.loadout.extensions, []);
+    }
+  }
+  assert.equal(readFileSync(imported, "utf8"), "imported\nimported\n", "Read-only inheritance must not import the PM module");
+  assert.ok(f.requests().filter(r => r.child).every(r => !/ROLE_TEAM_PM_ORIGINAL/.test(r.prompt)));
+});
+
+for (const transport of ["stdio", "http"] as const) test(`no-role children reconstruct selected PM ${transport} MCP tools without ambient discovery`, { timeout: 30000 }, async t => {
+  const f = fixture(t), log = join(f.dir, "peer.jsonl");
+  const peer = transport === "http" ? await startRoleMcpPeer({ id: "inherited", http: true, tools: ["echo", "unselected"], log }) : undefined;
+  if (peer) t.after(() => peer.stop());
+  const config = peer ? { url: peer.url } : { command: process.execPath, args: [roleMcpServerPath, JSON.stringify({ id: "inherited", tools: ["echo", "unselected"], log })] };
+  writeFileSync(f.role, 'schema_version: 1\nid: pm\ndescription: PM MCP\nsystem_prompt: ./pm.md\nbuiltin_tools: [read]\nmcp: [{server: selected, tools: [echo]}]\ndefaults: {access: full}\n');
+  writeFileSync(f.config, `schema_version: 1\nenabled: true\nmain_role: pm\nroles: {pm: ./pm.yaml}\nmcp_servers: {selected: ${JSON.stringify(config)}}\n`);
+  writeFileSync(join(f.dir, ".pi/mcp.json"), JSON.stringify({ mcpServers: { trap: { command: process.execPath, args: ["-e", "require('node:fs').writeFileSync('ambient-child-connected','bad')"] } } }));
+  const rpc = f.open();
+  for (const access of ["full", "read-only"] as const) {
+    const name = `inherit-mcp-${access}`;
+    await call(rpc, "subagent", { name, access, model: "role-team-fixture/worker", context: "none", task: access === "full" ? 'CALL {"name":"mcp__selected__echo","arguments":{}}' : "CHILD_INSPECT" });
+    await idle(rpc, () => records(f.dir).some(r => r.name === name && r.stopped));
+    const child = records(f.dir).find(r => r.name === name);
+    assert.equal(child.state, "completed", child.error);
+    assert.equal(child.version, 2); assert.equal(child.loadout.model, "role-team-fixture/worker");
+    if (access === "full") assert.match(child.output, /inherited:echo/);
+    else assert.deepEqual(child.loadout.tools, ["read", "ask_question"]);
+  }
+  const logs = readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line));
+  assert.equal(logs.filter(e => e.event === "initialize").length, 2, "Only the PM and its full child may connect");
+  assert.equal(logs.filter(e => e.event === "call-start").length, 1);
+  assert.equal(existsSync(join(f.dir, "ambient-child-connected")), false);
+  assert.ok(f.requests().filter(r => r.child).every(r => !r.tools.some((n: string) => /unselected|resources|codemode/.test(n))));
+});
+
+for (const source of ["settings", "package", "project-settings", "project-package"] as const) for (const resource of ["local", "http"] as const) test(`no-role full PM ${resource} inheritance validates ${source}-to-CLI provenance`, { timeout: 30000 }, async t => {
+  const f = fixture(t), peer = resource === "http" ? await startRoleMcpPeer({ id: "configured", http: true, tools: ["echo"] }) : undefined;
+  if (peer) t.after(() => peer.stop());
+  writeFileSync(join(f.dir, ".pi/tool.mjs"), "export default pi => pi.registerTool({name:'pm_local',label:'Local',description:'PM selected local',parameters:{type:'object',properties:{}},async execute(){return {content:[{type:'text',text:'CONFIGURED_PM_LOCAL_OK'}],details:{}}}});");
+  writeFileSync(f.role, 'schema_version: 1\nid: pm\ndescription: PM configured load\nsystem_prompt: ./pm.md\nbuiltin_tools: [read]\n' + (peer ? 'mcp: [{server: selected, tools: [echo]}]\n' : 'extra_tools: [{entry: ./tool.mjs, tools: [pm_local]}]\n') + 'defaults: {access: full}\n');
+  if (peer) writeFileSync(f.config, `schema_version: 1\nenabled: true\nmain_role: pm\nroles: {pm: ./pm.yaml}\nmcp_servers: {selected: {url: ${JSON.stringify(peer.url)}}}\n`);
+  const rpc = f.open([], [], false, source), name = `${source}-${resource}`;
+  const tool = peer ? "mcp__selected__echo" : "pm_local";
+  await call(rpc, "subagent", { name, access: "full", context: "none", task: `CALL ${JSON.stringify({ name: tool, arguments: {} })}` });
+  await idle(rpc, () => records(f.dir).some(r => r.name === name && r.stopped));
+  const child = records(f.dir).find(r => r.name === name);
+  assert.equal(child.state, "completed", child.error);
+  assert.match(child.output, peer ? /configured:echo/ : /CONFIGURED_PM_LOCAL_OK/);
+  const parentSource = child.availableLoadout.parentRole.tools.find((t: any) => t.name === tool).sourceInfo;
+  assert.notEqual(parentSource.source, "cli", "Fixture must exercise real non-CLI parent provenance");
+  assert.equal(parentSource.path, entry);
+  if (source.endsWith("package")) assert.equal(parentSource.origin, "package");
+});
+
+for (const workspace of ["standalone", "isolated"] as const) for (const explicit of [false, true]) test(`inherited PM stdio uses ${explicit ? "authored server" : "actual task"} cwd in ${workspace} execution`, { timeout: 30000 }, async t => {
+  const f = fixture(t), log = join(f.dir, "peer.jsonl"), serverCwd = join(f.dir, "server-workdir");
+  mkdirSync(serverCwd); writeFileSync(join(serverCwd, "input.txt"), "server working directory");
+  const config = { command: process.execPath, args: [roleMcpServerPath, JSON.stringify({ id: "cwd", tools: ["echo"], log })], ...(explicit ? { cwd: serverCwd } : {}) };
+  writeFileSync(f.role, 'schema_version: 1\nid: pm\ndescription: PM stdio cwd\nsystem_prompt: ./pm.md\nbuiltin_tools: [read]\nmcp: [{server: selected, tools: [echo]}]\ndefaults: {access: full}\n');
+  writeFileSync(f.config, `schema_version: 1\nenabled: true\nmain_role: pm\nroles: {pm: ./pm.yaml}\nmcp_servers: {selected: ${JSON.stringify(config)}}\n`);
+  const taskCwd = join(f.dir, "task-workdir"); mkdirSync(taskCwd); writeFileSync(join(taskCwd, "input.txt"), "task working directory");
+  if (workspace === "isolated") {
+    writeFileSync(join(f.dir, ".gitignore"), "agent/\nparent.jsonl\nrequests.jsonl\nrpc-subagents/\npeer.jsonl\n");
+    const git = (...args: string[]) => execFileSync("git", args, { cwd: f.dir, stdio: "pipe" });
+    git("init"); git("config", "user.name", "Fixture"); git("config", "user.email", "fixture@example.invalid"); git("add", "."); git("commit", "-m", "fixture");
+  }
+  const recordRoot = workspace === "isolated" ? mkdtempSync(join(tmpdir(), "role-pm-workflow-sessions-")) : f.dir;
+  if (recordRoot !== f.dir) t.after(() => rmSync(recordRoot, { recursive: true, force: true }));
+  const rpc = f.open([], recordRoot === f.dir ? [] : ["--session", join(recordRoot, "parent.jsonl")]), task = 'CALL {"name":"mcp__selected__echo","arguments":{}}';
+  if (workspace === "standalone") {
+    await call(rpc, "subagent", { name: "cwd-worker", access: "full", context: "none", cwd: taskCwd, task });
+  } else {
+    await call(rpc, "workflow_run", { context: "none", workspace: "isolated", validationCommand: "true", steps: [{ id: "legacy", task, access: "full", dependsOn: [] }] });
+    await idle(rpc, () => records(recordRoot).some(r => r.steps && ["completed", "paused"].includes(r.state)));
+    const workflow = records(recordRoot).find(r => r.steps);
+    assert.equal(workflow.state, "completed", JSON.stringify(workflow));
+  }
+  await idle(rpc, () => records(recordRoot).some(r => r.task === task && r.stopped));
+  const child = records(recordRoot).find(r => r.task === task);
+  assert.equal(child.state, "completed", child.error);
+  assert.notEqual(child.loadout.cwd, f.dir);
+  if (workspace === "standalone") assert.equal(child.loadout.cwd, taskCwd);
+  const starts = readFileSync(log, "utf8").split("\n").filter(Boolean).map(line => JSON.parse(line)).filter(e => e.event === "start");
+  assert.equal(starts.length, 2);
+  assert.equal(starts[0].cwd, explicit ? serverCwd : f.dir);
+  assert.equal(starts[1].cwd, explicit ? serverCwd : child.loadout.cwd, "An omitted stdio cwd must bind to the real task/worktree, without changing explicit authored cwd");
+});
+
+test("failed catalog reload keeps the retained valid directory dispatchable", { timeout: 30000 }, async t => {
+  const f = fixture(t), rpc = f.open();
+  for (const name of ["before-reload", "after-reload"]) {
+    if (name === "after-reload") {
+      writeFileSync(f.config, readFileSync(f.config, "utf8") + "unexpected: true\n");
+      await rpc.request("prompt", { message: "/roles reload" });
+      assert.ok(f.events.some(e => /kept the previous valid directory/.test(JSON.stringify(e))));
+    }
+    const before = f.events.filter(e => e.type === "tool_execution_end" && e.toolName === "subagent").length;
+    await call(rpc, "subagent", { role: "reviewer", task: "CHILD_INSPECT", name });
+    await idle(rpc, () => f.events.filter(e => e.type === "tool_execution_end" && e.toolName === "subagent").length > before);
+    const receipt = f.events.filter(e => e.type === "tool_execution_end" && e.toolName === "subagent").at(-1);
+    assert.equal(receipt.isError, false, JSON.stringify(receipt));
+    await idle(rpc, () => records(f.dir).some(r => r.name === name && r.stopped));
+    assert.equal(records(f.dir).find(r => r.name === name).state, "completed");
+  }
 });
 
 test("role model overrides clamp inherited thinking to the selected model's supported levels", { timeout: 25000 }, async t => {

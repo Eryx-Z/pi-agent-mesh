@@ -1,6 +1,7 @@
 import { getPackageDir, loadSkills, type ExtensionAPI, type ExtensionContext, type ExtensionCommandContext, type BeforeAgentStartEvent, type Skill, type RegisteredCommand } from "@earendil-works/pi-coding-agent";
-import { existsSync, readFileSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { closeSync, existsSync, fsyncSync, linkSync, openSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { snapshotSkills, snapshotTool, type ToolSnapshot } from "./loadout.ts";
 import { createRolePlan, effectiveRole, rolePlanDigest, ROLE_MAIN_EXTENSION, snapshotMainRoleTools, validateMainRoleTools, validateRolePlan, type RolePlan, type RoleToolSnapshot } from "./role-loadout.ts";
@@ -17,6 +18,29 @@ const copy = <T>(value: T): T => JSON.parse(JSON.stringify(value));
 export function roleHostSupported(): boolean {
   const version = JSON.parse(readFileSync(join(getPackageDir(), "package.json"), "utf8")).version as string;
   return /^1\.(?:[1-9]\d*\.\d+|0\.(?:[2-9]|\d{2,}))$/.test(version);
+}
+
+/** Native Pi does not flush setup/custom entries until a user/assistant message exists.
+ * Keep failures independently, without precreating its session file (the host first flush uses wx).
+ * Publish an immutable sibling with no-clobber link, private mode, and file + directory fsync. */
+function retainPmFailure(ctx: ExtensionContext, error: string): string {
+  const sessionFile = ctx.sessionManager.getSessionFile();
+  if (!sessionFile) throw new Error("No persistent session path is available for a PM failure record");
+  const path = `${sessionFile}.agent-mesh-pm-failure-${randomUUID()}.json`, temporary = `${path}.tmp`;
+  let fd: number | undefined, created = false;
+  try {
+    fd = openSync(temporary, "wx", 0o600); created = true;
+    writeFileSync(fd, JSON.stringify({ version: 1, state: "failed", error, timestamp: new Date().toISOString(),
+      sessionFile, sessionId: ctx.sessionManager.getSessionId?.(), cwd: ctx.cwd }, null, 2) + "\n");
+    fsyncSync(fd); closeSync(fd); fd = undefined;
+    linkSync(temporary, path); // Never follow or replace an existing destination, including symlinks.
+  } finally {
+    try { if (fd !== undefined) closeSync(fd); }
+    finally { if (created) unlinkSync(temporary); }
+  }
+  const directory = openSync(dirname(path), "r");
+  try { fsyncSync(directory); } finally { closeSync(directory); }
+  return path;
 }
 
 /** Session-scoped PM state. All mesh-owned wakeups route through this gate. */
@@ -42,6 +66,18 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
     context?.ui.notify(`PM not ready: ${error}. Inspect /roles and start a new session after fixing resources.`, "error");
     context?.ui.setStatus("agent-mesh-role", "PM failed");
   };
+  function verifyMcpOwnership() {
+    // Pi exposes duplicate command owners as mcp:1, mcp:2, etc. Reserving our own
+    // /mcp replaces the builtin, but cannot cancel an explicit factory's handlers.
+    // Server registrations alone are not owners: our controlled adapter filters those.
+    const competing = (pi.getCommands?.() ?? []).filter(command => command.source === "extension" && /^mcp(?::\d+)?$/.test(command.name) && command.sourceInfo.path !== ROLE_MAIN_EXTENSION);
+    if (competing.length) throw new Error(`PM MCP ownership conflict: ${competing.map(command => `${command.name} (${command.sourceInfo.path})`).join(", ")}. Disable the competing MCP extension and start a new session; PM cannot isolate another extension's lifecycle connections`);
+  }
+  function verifyLocalOwnership(active: RolePlan) {
+    const names = new Set(effectiveRole(active, active.access).extraTools.flatMap(entry => entry.tools));
+    const competing = pi.getAllTools().find(tool => names.has(tool.name) && tool.sourceInfo.path !== ROLE_MAIN_EXTENSION);
+    if (competing) throw new Error(`PM local tool ownership conflict: ${competing.name} (${competing.sourceInfo.path}). Disable the independently loaded entry and start a new session; selected local tools require the controlled PM loader`);
+  }
   function management() {
     return MANAGEMENT_TOOLS.map(name => {
       const tool = pi.getAllTools().find(t => t.name === name);
@@ -56,7 +92,7 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
   }
   function verify() {
     if (state !== "ready" || !plan || !saved) throw new Error(error || "PM is initializing");
-    local?.verify(); mcp?.verify(); validateRolePlan(plan, { access: plan.access });
+    verifyMcpOwnership(); verifyLocalOwnership(plan); local?.verify(); mcp?.verify(); validateRolePlan(plan, { access: plan.access });
     if (!isDeepStrictEqual(copy(inventory()), saved.tools) || !isDeepStrictEqual(management(), saved.management)) throw new Error("PM actual tool definition/provenance changed after preflight");
   }
   function activate() {
@@ -93,6 +129,11 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
     get state() { return state; },
     get error() { return error; },
     get command() { return command; },
+    inheritance() {
+      if (state === "off") return;
+      verify();
+      return copy({ version: 1 as const, plan: plan!, tools: saved!.tools });
+    },
     notify(message: Notification) {
       if (!context) return;
       if (state === "off") { pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true }); return; }
@@ -131,9 +172,11 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
           plan = createRolePlan(role, directory.current, { ...roleSettings(pi, ctx, model), cwd: ctx.cwd, context: "none", access: role.defaults.access });
         }
         if (!ctx.sessionManager.getSessionFile()) throw new Error("PM role mode requires a persistent session (remove --no-session)");
+        verifyMcpOwnership();
         const active = plan;
         validateRolePlan(active, { access: active.access });
         const effective = effectiveRole(active, active.access);
+        verifyLocalOwnership(active);
         if ((effective.extraTools.length || effective.mcp.length) && !ctx.isProjectTrusted()) throw new Error(`Role ${active.roleId}: project trust is required before local tools or MCP can execute`);
         const model = ctx.modelRegistry.find(active.model.slice(0, active.model.indexOf("/")), active.model.slice(active.model.indexOf("/") + 1));
         if (!model) throw new Error(`PM model is unavailable: ${active.model}`);
@@ -176,6 +219,7 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
         if (current !== generation) return;
         signal.throwIfAborted();
         if (Date.now() >= deadline) throw new Error("PM readiness deadline expired");
+        verifyMcpOwnership();
         const tools = inventory(), runtimeTools = management();
         if (saved && (!isDeepStrictEqual(tools, saved.tools) || !isDeepStrictEqual(runtimeTools, saved.management))) throw new Error("Saved PM tool definitions/provenance drifted");
         allowed = [...tools.map(t => t.name), ...MANAGEMENT_TOOLS]; activate();
@@ -187,8 +231,18 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
         flush();
       } catch (cause) {
         if (current !== generation) return;
-        fail(cause); local?.dispose(); await mcp?.close();
-        pi.appendEntry("agent_mesh_pm_failure", { version: 1, error });
+        fail(cause);
+        let recordPath: string | undefined, persistenceError: string | undefined;
+        try {
+          recordPath = retainPmFailure(ctx, error);
+          ctx.ui.notify(`PM failure record: ${recordPath}`, "info");
+        } catch (cause) {
+          persistenceError = cause instanceof Error ? cause.message : String(cause);
+          ctx.ui.notify(`PM failure record is not durable: ${persistenceError}. Original PM error: ${error}`, "error");
+        }
+        try { pi.appendEntry("agent_mesh_pm_failure", { version: 1, error, recordPath, persistenceError }); }
+        catch (cause) { ctx.ui.notify(`PM failure session entry could not be appended: ${cause instanceof Error ? cause.message : String(cause)}. Original PM error: ${error}`, "error"); }
+        local?.dispose(); await mcp?.close();
       } finally { clearTimeout(timer); }
     },
     stop,

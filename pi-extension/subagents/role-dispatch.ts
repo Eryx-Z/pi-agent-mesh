@@ -24,7 +24,7 @@ export function roleSettings(pi: ExtensionAPI, ctx: ExtensionContext, model: str
 export async function resolveRoleDispatch(pi: ExtensionAPI, ctx: ExtensionContext, catalog: RoleCatalogAccess, request: RoleRequest,
   workflow: { model?: string; context?: ContextMode; contextText?: string } = {}): Promise<{ plan: RolePlan; contextText?: string }> {
   const loaded = await catalog.current(ctx), directory = loaded.current;
-  if (!directory?.enabled || loaded.error) throw new Error(`Role dispatch requires a valid enabled role catalog: ${loaded.error ?? "team mode disabled"}`);
+  if (!directory?.enabled) throw new Error(`Role dispatch requires a valid enabled role catalog: ${loaded.error ?? "team mode disabled"}`);
   const role = directory.roles.find(r => r.id === request.role); if (!role) throw new Error(`Role not found: ${request.role}`);
   const model = selectedModel(ctx, request.model ?? (role.defaults.model !== "inherit" ? role.defaults.model : undefined) ?? workflow.model);
   const context = request.context ?? role.defaults.context ?? workflow.context ?? "partial", access = accessMode(request.access ?? role.defaults.access);

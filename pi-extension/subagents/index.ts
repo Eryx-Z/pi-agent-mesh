@@ -14,7 +14,7 @@ import { closeDashboards } from "./dashboard.ts";
 import { registerRoles } from "./roles-ui.ts";
 import { createTeamRuntime, installMainMcpRouter } from "./pm.ts";
 import { resolveRoleDispatch, selectedModel } from "./role-dispatch.ts";
-import type { RolePlan } from "./role-loadout.ts";
+import { ROLE_MAIN_EXTENSION, type RolePlan } from "./role-loadout.ts";
 import type { StepDefinition } from "./workflows.ts";
 
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
@@ -33,7 +33,17 @@ const stepSchema = Type.Object({
   dependsOn: Type.Array(Type.String({ minLength: 1 }), { uniqueItems: true }),
 }, { additionalProperties: false });
 export default async function subagentsExtension(pi: ExtensionAPI) {
-  if (process.env.PI_RPC_SUBAGENT_CHILD === "1") return;
+  if (process.env.PI_RPC_SUBAGENT_CHILD === "1") {
+    const path = process.env.PI_RPC_SUBAGENT_LOADOUT;
+    if (path) {
+      const inherited = JSON.parse(readFileSync(path, "utf8"));
+      if (inherited.parentRole !== undefined) {
+        const { inheritMainRoleTools } = await import("./role-inheritance.ts");
+        await inheritMainRoleTools(pi, inherited);
+      }
+    }
+    return;
+  }
   const catalog = registerRoles(pi)!;
   const team = createTeamRuntime(pi, catalog);
   pi.on("input", (_event, ctx) => team.input(ctx));
@@ -60,7 +70,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
     if (slash < 1) throw new Error("Use a canonical provider/model ID");
     const model = ctx.modelRegistry.find(requested.slice(0, slash), requested.slice(slash + 1));
     if (!model) throw new Error(`Model not found: ${requested}`);
-    return resolveLoadout(pi, promptOptions?.skills, resolve(ctx.cwd, params.cwd ?? "."), `${model.provider}/${model.id}`, ctx.thinkingLevel ?? "medium");
+    const inherited = resolveLoadout(pi, promptOptions?.skills, resolve(ctx.cwd, params.cwd ?? "."), `${model.provider}/${model.id}`, ctx.thinkingLevel ?? "medium");
+    if (inherited.extensions.includes(ROLE_MAIN_EXTENSION)) inherited.parentRole = team.inheritance();
+    return inherited;
   }
   function snapshot(id: string, mode: string, ctx: ExtensionContext) {
     const value = mode === "full" ? snapshots.get(id) ?? snapshotContext(ctx.sessionManager) : undefined;
@@ -83,6 +95,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
     manager = await TaskManager.open(new TaskStore(dir), {
       maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
       command: process.execPath, baseArgs: [cli],
+      isProjectTrusted: () => ctx.isProjectTrusted(),
       notify(record, kind) {
         if (kind === "result") display.result(record);
         const content = kind === "question"
@@ -107,8 +120,14 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
     const old = manager, oldFlows = workflows;
     old?.fenceRecovery();
     manager = undefined; workflows = undefined; ctxForWidget = undefined;
-    await team.stop();
-    try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); }
+    // Native model authentication can be unbounded. Drain it before replacement,
+    // but start owned-worker cleanup immediately and await both even on errors.
+    const stopped = await Promise.allSettled([
+      team.stop(),
+      (async () => { try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); } })(),
+    ]);
+    const failed = stopped.find(r => r.status === "rejected");
+    if (failed?.status === "rejected") throw failed.reason;
   });
   pi.on("tool_call", (event, ctx) => {
     if (event.toolName === "workflow_run" || event.toolName === "workflow_control" && event.input?.action === "update" || event.toolName === "subagent") snapshots.set(event.toolCallId, snapshotContext(ctx.sessionManager));

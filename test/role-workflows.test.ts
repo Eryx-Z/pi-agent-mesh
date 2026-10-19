@@ -30,7 +30,7 @@ function fixture(t: { after(fn: () => void | Promise<void>): void }) {
     writeFileSync(join(dir, `${id}.yaml`), `schema_version: 1\nid: ${id}\ndescription: Test ${id}\nsystem_prompt: ./${id}.md\nbuiltin_tools: [read${id === "builder" ? ", write" : ""}]\ndefaults: {access: ${id === "builder" ? "full" : "read-only"}}\n`);
     writeFileSync(join(dir, `${id}.md`), `FROZEN_${id.toUpperCase()}_BODY\n`);
   }
-  const tasks = new TaskManager(new TaskStore(join(dir, "tasks")), { command: process.execPath, baseArgs: [cli] });
+  const tasks = new TaskManager(new TaskStore(join(dir, "tasks")), { command: process.execPath, baseArgs: [cli], isProjectTrusted: () => true });
   const workflows = new WorkflowManager(tasks, join(dir, "workflows"));
   const directory = new RoleCatalog(dir, config).reload();
   const plan = (id: string, context: "none" | "partial" | "full" = "none", access: "full" | "read-only" = id === "builder" ? "full" : "read-only") => createRolePlan(directory.roles.find(r => r.id === id)!, directory,

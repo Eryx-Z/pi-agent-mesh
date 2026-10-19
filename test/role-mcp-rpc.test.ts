@@ -22,7 +22,7 @@ async function until(check: () => boolean, reason = "condition") {
 function fixture(t: { after(fn: () => void | Promise<void>): void }, readinessMs = 30000) {
   const dir = mkdtempSync(join(tmpdir(), "role-mcp-rpc-"));
   const events: any[] = [];
-  const manager = new TaskManager(new TaskStore(join(dir, "tasks")), { command: process.execPath, baseArgs: [cli], roleReadinessMs: readinessMs,
+  const manager = new TaskManager(new TaskStore(join(dir, "tasks")), { command: process.execPath, baseArgs: [cli], isProjectTrusted: () => true, roleReadinessMs: readinessMs,
     createRpc: launch => { const rpc = new RpcProcess(launch); rpc.on("event", event => events.push(event)); return rpc; } });
   t.after(async () => { await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); });
   const plan: RolePlan = { version: 1, schemaVersion: 1, promptVersion: 1, roleId: "builder", manifestPath: join(dir, "saved-role.yaml"), manifestHash: hash("saved manifest"),
@@ -73,10 +73,12 @@ for (const transport of ["stdio", "http"] as const) {
   test(`${transport} MCP progress resets request timeout but parent cancellation still closes only owned resources`, { timeout: 15000 }, async t => {
     const f = fixture(t), peer = transport === "http" ? await startRoleMcpPeer({ id: "progress_peer", http: true, tools: ["progress"] }) : undefined;
     if (peer) t.after(() => peer.stop());
-    f.plan.mcp = [peer ? { server: "progress_peer", config: { url: peer.url!, timeout: 0.12 }, tools: ["progress"] } : { ...f.stdio("progress_peer", { tools: ["progress"] }, ["progress"]), config: { ...f.stdio("progress_peer").config, timeout: 0.12 } }];
-    const record = await f.manager.launch({ task: 'RAW progress_peer/progress {"progressIntervalMs":25}', access: "full", context: "none", rolePlan: f.plan });
+    // The native timeout also covers initialize/list, so allow loaded-suite startup.
+    // Twelve 100ms updates still prove the call survives beyond its 1s timeout.
+    f.plan.mcp = [peer ? { server: "progress_peer", config: { url: peer.url!, timeout: 1 }, tools: ["progress"] } : { ...f.stdio("progress_peer", { tools: ["progress"] }, ["progress"]), config: { ...f.stdio("progress_peer").config, timeout: 1 } }];
+    const record = await f.manager.launch({ task: 'RAW progress_peer/progress {"progressIntervalMs":100}', access: "full", context: "none", rolePlan: f.plan });
     const peerEvents = () => peer?.logs() ?? f.events("progress_peer");
-    await until(() => peerEvents().filter(e => e.event === "progress").length >= 8, "sustained progress beyond request timeout");
+    await until(() => peerEvents().filter(e => e.event === "progress").length >= 12, "sustained progress beyond request timeout");
     assert.equal(record.stopped, false);
     const start = Date.now(); await f.manager.cancel(record.id);
     assert.ok(Date.now() - start < 3000); assert.equal(record.stopped, true); assert.equal(record.state, "cancelled");
@@ -87,7 +89,7 @@ for (const transport of ["stdio", "http"] as const) {
 }
 
 test("native MCP request timeout produces failed tool result without replaying the call", { timeout: 15000 }, async t => {
-  const f = fixture(t); f.plan.mcp = [{ ...f.stdio("local", { tools: ["hang"] }, ["hang"]), config: { ...f.stdio("local", { tools: ["hang"] }).config, timeout: 0.1 } }];
+  const f = fixture(t); f.plan.mcp = [{ ...f.stdio("local", { tools: ["hang"] }, ["hang"]), config: { ...f.stdio("local", { tools: ["hang"] }).config, timeout: 1 } }];
   const record = await f.launch("RAW local/hang");
   const result = toolResults(record.sessionFile).find(t => t.toolName.startsWith("mcp__"));
   assert.equal(result.isError, true); assert.match(JSON.stringify(result.content), /timed out|timeout/i);

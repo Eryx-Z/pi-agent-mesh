@@ -59,7 +59,7 @@ for (const context of ["partial", "full"] as const) {
       if (checkpoint === "submitting-retained" || checkpoint === "submitted") seedSession(record.sessionFile, dir, context, context === "full" ? snapshot : [], record.taskInput!.parentSession);
       store.save(record); writeFileSync(`${store.path(id)}.lock`, "stale");
       const controller: ExecutionController = { prepare: () => ({ ...record.execution!.boundary, unit: `pi-execution-${randomUUID()}.scope` }), wrap: launch => launch, cleanup: async () => {} };
-      manager = await TaskManager.open(store, { command: process.execPath, baseArgs: [cli], executionController: controller, recoveryDelayMs: 10, maxConcurrent: 1 });
+      manager = await TaskManager.open(store, { command: process.execPath, baseArgs: [cli], isProjectTrusted: () => true, executionController: controller, recoveryDelayMs: 10, maxConcurrent: 1 });
       manager.startRecovery();
       const restored = manager.get(id);
       if (checkpoint === "submitting") {

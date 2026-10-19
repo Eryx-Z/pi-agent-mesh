@@ -25,7 +25,7 @@ function fixture(t: { after(fn: () => void | Promise<void>): void }) {
   writeFileSync(join(dir, "role.yaml"), "schema_version: 1\nid: builder\ndescription: Test builder\nsystem_prompt: ./system.md\nbuiltin_tools: [read, bash]\ndefaults: {access: full, context: none}\n");
   writeFileSync(join(dir, "system.md"), "SAVED_ROLE_BODY_ONLY\n");
   writeFileSync(join(dir, "fixture-input.txt"), "Role builtin read works");
-  const manager = new TaskManager(new TaskStore(join(dir, "tasks")), { command: process.execPath, baseArgs: [cli] });
+  const manager = new TaskManager(new TaskStore(join(dir, "tasks")), { command: process.execPath, baseArgs: [cli], isProjectTrusted: () => true });
   t.after(async () => { await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); });
   function plan(access: "full" | "read-only" = "full", context: "none" | "partial" | "full" = "none") {
     const directory = new RoleCatalog(dir, config).reload();

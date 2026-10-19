@@ -53,7 +53,7 @@ function fixture(t: { after(fn: () => void | Promise<void>): void }, alter: (val
       rpc.emit("event", { type: "agent_start" });
     }
   };
-  const manager = new TaskManager(store, { command: "unused", changed: () => changed?.(), createRpc: launch => { rpc.launch = launch; return rpc; } });
+  const manager = new TaskManager(store, { command: "unused", isProjectTrusted: () => true, changed: () => changed?.(), createRpc: launch => { rpc.launch = launch; return rpc; } });
   t.after(async () => { stopFails = false; await manager.shutdown(); rmSync(dir, { recursive: true, force: true }); });
   return { dir, plan, store, manager, rpc, prompts, requests, onChange: (fn: () => void) => changed = fn, changeSchema: () => schemaChange = true, failStop: () => stopFails = true };
 }

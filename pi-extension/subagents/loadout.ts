@@ -4,6 +4,7 @@ import { realpathSync, statSync } from "node:fs";
 import { dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import type { RolePlan, RoleToolSnapshot } from "./role-loadout.ts";
 
 export const CHILD_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "child.ts");
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
@@ -21,6 +22,7 @@ export function applyAccess(loadout: Loadout, access: AccessMode): Loadout {
     l.toolMetadata = l.toolMetadata.filter(t => t.source === "builtin" && ["read", "grep", "find", "ls"].includes(t.name));
     l.tools = [...l.toolMetadata.map(t => t.name), "ask_question"];
     l.extensions = [];
+    delete l.parentRole;
   }
   return validateLoadout(l);
 }
@@ -41,6 +43,8 @@ export interface Loadout {
   model: string; thinking: string; cwd: string; agentDir: string;
   /** Explicitly advertised provider-only entrypoints; independent of tool access. */
   providerExtensions?: string[];
+  /** Frozen implementation mapping for PM-owned tools on the ordinary inherited path. */
+  parentRole?: { version: 1; plan: RolePlan; tools: RoleToolSnapshot[] };
 }
 export function nonempty(value: unknown, field: string): string {
   if (typeof value !== "string" || !value.trim()) throw new Error(`${field} must be a nonempty string`);
@@ -126,6 +130,10 @@ export function validateLoadout(value: unknown, options: { resources?: boolean }
   }
   const extensions = [...new Set(l.toolMetadata.filter(t => t.source === "extension").map(t => t.path))];
   if (!isDeepStrictEqual(l.extensions, extensions)) throw new Error("Extension sources do not match inherited tools");
+  if (l.parentRole !== undefined && (!l.parentRole || l.parentRole.version !== 1 || !l.parentRole.plan ||
+      !Array.isArray(l.parentRole.tools) || !l.extensions.includes(join(dirname(CHILD_EXTENSION), "index.ts")))) {
+    throw new Error("Invalid inherited PM implementation mapping");
+  }
   if (l.providerExtensions !== undefined && (!Array.isArray(l.providerExtensions) ||
       new Set(l.providerExtensions).size !== l.providerExtensions.length ||
       l.providerExtensions.some(p => sourcePath(p, "model provider") !== p))) throw new Error("Invalid provider entrypoints");

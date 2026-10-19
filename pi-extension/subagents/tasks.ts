@@ -10,7 +10,7 @@ import { diagnoseFailure } from "./diagnostics.ts";
 import { SystemdExecutionController, readProcessIdentity, isProcessIdentityAlive, type ExecutionController } from "./execution.ts";
 import { acquireExecutionLease, type ExecutionLease } from "./lease.ts";
 import { isDeepStrictEqual } from "node:util";
-import { initialRoleLoadout, mergeRoleBaseline, rolePlanDigest, ROLE_CHILD_EXTENSION,
+import { effectiveRole, initialRoleLoadout, mergeRoleBaseline, rolePlanDigest, ROLE_CHILD_EXTENSION,
   snapshotRoleLoadout, validateRolePlan, validateRoleSnapshot, type RolePlan, type RoleRun, type RolePreflightResult } from "./role-loadout.ts";
 
 export type NewTask = {
@@ -30,6 +30,8 @@ interface ManagerOptions {
   command: string; baseArgs?: string[]; maxConcurrent?: number;
   createRpc?: (launch: RpcLaunch) => RpcProcess;
   executionController?: ExecutionController;
+  /** Live parent trust, never persisted; absent means untrusted for role local/MCP resources. */
+  isProjectTrusted?: () => boolean;
   changed?: () => void; notify?: (record: TaskRecord, kind: "result" | "question") => void;
   /** Tests may shorten delays; production retries are bounded and back off. */
   recoveryDelayMs?: number;
@@ -133,6 +135,13 @@ export class TaskManager {
   assertOwnership(): void {
     if (this.lease && !this.lease.alive) throw new Error("Execution ownership lease was lost; manager is fenced");
   }
+  private assertRoleTrust(plan: RolePlan | undefined, access: AccessMode): void {
+    if (!plan) return;
+    const effective = effectiveRole(plan, access);
+    if ((effective.extraTools.length || effective.mcp.length) && this.options.isProjectTrusted?.() !== true) {
+      throw new Error(`Role ${plan.roleId}: project trust is required before executing local tools or connecting MCP`);
+    }
+  }
   private save(record: TaskRecord, announce = true): void {
     this.assertOwnership();
     record.updatedAt = Date.now();
@@ -156,6 +165,7 @@ export class TaskManager {
     if (plan && input.context !== "partial" && input.contextText !== undefined) throw new Error("Role contextText is only supported for partial context");
     if (!plan) validateLoadout(input.loadout);
     if (input.context === "full" && plan && !Array.isArray(input.snapshot)) throw new Error("Role full context requires an explicit frozen parent snapshot");
+    this.assertRoleTrust(plan ?? input.loadout?.parentRole?.plan, input.access);
     const id = randomUUID();
     const record: TaskRecord = {
       version: plan ? 3 : 2, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
@@ -192,6 +202,7 @@ export class TaskManager {
     if (this.live.has(record.id)) throw new Error("Task is already running or stopping");
     this.store.validateForContinue(record);
     if (!this.hasCapacity()) throw new Error("Global subagent concurrency limit reached; wait for a child to stop");
+    this.assertRoleTrust(record.rolePlan ?? (available as Loadout).parentRole?.plan, selected);
     const release = this.store.lock(record.id);
     if (!automatic) {
       record.recoveryRuns = 0;
@@ -236,12 +247,15 @@ export class TaskManager {
       this.assertOwnership();
       if (this.closed) throw new Error("Parent session is shutting down");
       release ??= this.store.lock(record.id);
+      this.assertRoleTrust(record.rolePlan ?? (record.loadout as Loadout).parentRole?.plan, record.access!);
       const readinessDeadline = record.version === 3 ? Date.now() + (this.options.roleReadinessMs ?? 30000) : undefined;
       let launch = childLaunch(record, this.store.dir, this.options.command, this.options.baseArgs, readinessDeadline);
       const boundary = this.lease ? this.options.executionController?.prepare(record.id, record.run) : undefined;
       record.execution = boundary ? { boundary, intent: "running", cleanup: "pending" } : undefined;
       this.save(record); // Identity is durable before the launcher can create a scope.
       if (boundary) launch = this.options.executionController!.wrap(launch, boundary);
+      // Persistence listeners can revoke trust reentrantly; recheck at the actual spawn boundary.
+      this.assertRoleTrust(record.rolePlan ?? (record.loadout as Loadout).parentRole?.plan, record.access!);
       const rpc = (this.options.createRpc ?? (l => new RpcProcess(l)))(launch);
       const live: LiveRun = { rpc, release, startupPhase: phase, pendingMessages: 1, settled: false, started: false, finalTools: new Map(), finalOutput: new Map(), submission: 0 };
       this.live.set(record.id, live);
