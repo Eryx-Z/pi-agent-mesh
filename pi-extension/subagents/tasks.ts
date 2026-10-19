@@ -9,12 +9,15 @@ import type { AgentMessage } from "./context.ts";
 import { diagnoseFailure } from "./diagnostics.ts";
 import { SystemdExecutionController, readProcessIdentity, isProcessIdentityAlive, type ExecutionController } from "./execution.ts";
 import { acquireExecutionLease, type ExecutionLease } from "./lease.ts";
+import { isDeepStrictEqual } from "node:util";
+import { effectiveRole, initialRoleLoadout, mergeRoleBaseline, rolePlanDigest, ROLE_CHILD_EXTENSION,
+  snapshotRoleLoadout, validateRolePlan, validateRoleSnapshot, type RolePlan, type RoleRun, type RolePreflightResult } from "./role-loadout.ts";
 
-export interface NewTask {
+export type NewTask = {
   name?: string; task: string; access: AccessMode; context: ContextMode; contextText?: string;
   workflow?: { id: string; stepId: string; attemptId?: string };
-  loadout: Loadout; snapshot?: AgentMessage[]; parentSession?: string;
-}
+  snapshot?: AgentMessage[]; parentSession?: string;
+} & ({ loadout: Loadout; rolePlan?: never } | { rolePlan: RolePlan; loadout?: never });
 interface LiveRun {
   rpc: RpcProcess; release: () => void; finishing?: Promise<void>; pendingMessages: number;
   startupPhase?: string;
@@ -32,6 +35,7 @@ interface ManagerOptions {
   recoveryDelayMs?: number;
 }
 export function childLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[] = []): RpcLaunch {
+  if (record.version === 3) return roleChildLaunch(record, dir, command, baseArgs);
   const l = validateLoadout(record.loadout);
   const loadoutPath = join(dir, `${record.id}.loadout.json`);
   const promptPath = join(dir, `${record.id}.prompt.md`);
@@ -51,6 +55,32 @@ export function childLaunch(record: TaskRecord, dir: string, command: string, ba
       ...l.skills.flatMap(s => ["--skill", s.loadPath ?? s.filePath]),
       "-e", CHILD_EXTENSION, ...[...new Set([...(l.providerExtensions ?? []), ...l.extensions])].flatMap(p => ["-e", p])],
   };
+}
+function newRoleRun(record: Pick<TaskRecord, "id" | "run" | "workflow">, plan: RolePlan, access: AccessMode, continuationMessage?: string): RoleRun {
+  return { version: 1, binding: { taskId: record.id, run: record.run, attemptId: randomUUID(), nonce: randomUUID(), planHash: rolePlanDigest(plan) },
+    access, status: "planned", outcome: "running", cleanup: "pending", ...(continuationMessage !== undefined ? { continuationMessage } : {}) };
+}
+function roleResultPath(record: TaskRecord, dir: string): string {
+  return join(dir, `${record.id}.${record.run}.${record.roleRuns!.at(-1)!.binding.nonce}.preflight.json`);
+}
+function roleChildLaunch(record: TaskRecord, dir: string, command: string, baseArgs: string[]): RpcLaunch {
+  const plan = validateRolePlan(record.rolePlan, { access: record.access });
+  const run = record.roleRuns!.at(-1)!;
+  const effective = effectiveRole(plan, run.access);
+  // Fail before importing local code or launching resources; MCP belongs to M3.
+  if (effective.mcp.length) throw new Error("Role MCP execution requires M3");
+  const runPath = join(dir, `${record.id}.${record.run}.role-run.json`);
+  const promptPath = join(dir, `${record.id}.${record.run}.prompt.md`);
+  atomicWrite(runPath, JSON.stringify({ plan, run, resultPath: roleResultPath(record, dir) }));
+  atomicWrite(promptPath, `${plan.systemPrompt}\n\n${COOPERATION}`);
+  const env = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith("PI_SUBAGENT_") || key.startsWith("PI_RPC_SUBAGENT_") || key === "PI_SESSION_FILE" || key === "PI_SESSION_ID") delete env[key];
+  env.PI_RPC_SUBAGENT_ROLE_RUN = runPath; env.PI_RPC_SUBAGENT_CHILD = "1"; env.PI_CODING_AGENT_DIR = plan.agentDir;
+  return { command, cwd: plan.cwd, env, args: [...baseArgs, "--mode", "rpc", "--session", record.sessionFile,
+    "--no-extensions", "--no-skills", "--no-prompt-templates", "--no-context-files", "--no-approve",
+    "--model", plan.model, "--thinking", plan.thinking, "--append-system-prompt", promptPath,
+    ...plan.skills.flatMap(s => ["--skill", s.loadPath ?? s.filePath]),
+    "-e", ROLE_CHILD_EXTENSION, ...(plan.providerExtensions ?? []).flatMap(p => ["-e", p])] };
 }
 function text(message: any): string {
   return typeof message?.content === "string" ? message.content : (message?.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
@@ -105,7 +135,10 @@ export class TaskManager {
   }
   private save(record: TaskRecord, announce = true): void {
     this.assertOwnership();
-    record.updatedAt = Date.now(); this.store.save(record);
+    record.updatedAt = Date.now();
+    const run = record.roleRuns?.at(-1);
+    if (run) { run.outcome = record.state; run.error = record.error; run.cleanup = record.stopped ? "confirmed" : "pending"; }
+    this.store.save(record);
     if (announce) { this.options.changed?.(); for (const listener of this.listeners) listener(); }
   }
   get(id: string): TaskRecord {
@@ -118,15 +151,25 @@ export class TaskManager {
     if (!this.hasCapacity()) throw new Error("Global subagent concurrency limit reached; wait for a child to stop");
     if (!input.task.trim()) throw new Error("Task is required");
     const prompt = taskPrompt(input.task, input.access, input.context, input.contextText);
-    validateLoadout(input.loadout);
+    const plan = input.rolePlan ? structuredClone(validateRolePlan(input.rolePlan, { access: input.access })) : undefined;
+    if (plan && (plan.context !== input.context || plan.access !== input.access)) throw new Error("Role plan/input context or initial access mismatch");
+    if (plan && input.context !== "partial" && input.contextText !== undefined) throw new Error("Role contextText is only supported for partial context");
+    if (!plan) validateLoadout(input.loadout);
+    if (input.context === "full" && plan && !Array.isArray(input.snapshot)) throw new Error("Role full context requires an explicit frozen parent snapshot");
     const id = randomUUID();
     const record: TaskRecord = {
-      version: 2, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
-      task: input.task, access: input.access, context: input.context, loadout: applyAccess(input.loadout, input.access),
-      availableLoadout: structuredClone(input.loadout), workflow: input.workflow,
+      version: plan ? 3 : 2, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
+      task: input.task, access: input.access, context: input.context,
+      loadout: plan ? initialRoleLoadout(plan, input.access) : applyAccess(input.loadout!, input.access),
+      availableLoadout: plan ? undefined : structuredClone(input.loadout), workflow: input.workflow,
+      ...(plan ? { rolePlan: plan, roleBaseline: [], taskInput: { task: input.task, context: input.context,
+        ...(input.contextText !== undefined ? { contextText: input.contextText } : {}),
+        ...(input.context === "full" ? { snapshot: structuredClone(input.snapshot!) } : {}),
+        ...(input.parentSession ? { parentSession: input.parentSession } : {}), cwd: plan.cwd } } : {}),
       state: "running", startedAt: Date.now(), updatedAt: Date.now(), sessionFile: join(this.store.dir, `${id}.session.jsonl`),
       output: "", activity: "starting RPC", log: [], questions: [], stopped: false, run: 1,
     };
+    if (plan) record.roleRuns = [newRoleRun(record, plan, input.access)];
     // Reserve names and session ownership synchronously, before any startup awaits.
     this.records.set(id, record);
     try {
@@ -144,7 +187,7 @@ export class TaskManager {
     if (record.workflow && record.workflow.id !== workflowId) throw new Error("Use workflow_control retry for workflow steps");
     const selected = accessMode(access ?? record.access);
     const available = record.availableLoadout ?? record.loadout;
-    const effective = applyAccess(available, selected);
+    const effective = record.version === 3 ? initialRoleLoadout(validateRolePlan(record.rolePlan, { access: selected }), selected) : applyAccess(available as Loadout, selected);
     if (this.live.get(record.id)?.finishing && !record.stopped) throw new Error("Task shutdown is not confirmed; automatic cleanup pending");
     if (this.live.has(record.id)) throw new Error("Task is already running or stopping");
     this.store.validateForContinue(record);
@@ -156,13 +199,33 @@ export class TaskManager {
       record.supplementaryInstructions = [];
     }
     record.recovery = undefined;
-    record.version = 2; record.access = selected; record.availableLoadout = structuredClone(available); record.loadout = effective;
+    const previousRoleRun = record.roleRuns?.at(-1);
+    const neverSubmitted = record.version === 3 && record.roleRuns!.every(run => ["planned", "verified"].includes(run.status));
+    const preSubmissionRecovery = record.version === 3 && automatic && previousRoleRun && ["planned", "verified"].includes(previousRoleRun.status);
+    if (record.version !== 3) { record.version = 2; record.availableLoadout = structuredClone(available as Loadout); }
+    record.access = selected; record.loadout = effective;
     record.state = "running"; record.stopped = false; record.run++; record.error = undefined;
+    if (record.version === 3) {
+      const retainedMessage = preSubmissionRecovery ? previousRoleRun!.continuationMessage : message;
+      record.roleRuns!.push(newRoleRun(record, record.rolePlan!, selected, retainedMessage));
+    }
     record.questions = []; record.output = ""; record.startedAt = Date.now(); record.activity = "starting continuation";
     addLog(record, `Continuation ${record.run}: ${message}`);
-    try { this.save(record); }
+    try {
+      if (record.version === 3 && !existsSync(record.sessionFile)) {
+        const input = record.taskInput!;
+        seedSession(record.sessionFile, input.cwd, input.context, input.snapshot, input.parentSession);
+      }
+      this.save(record);
+    }
     catch (e) { release(); record.state = "failed"; record.stopped = true; throw e; }
-    await this.start(record, `${COOPERATION}\nAccess: ${record.access}\nContinuation task:\n${message}`, release);
+    const retained = record.roleRuns?.at(-1)?.continuationMessage;
+    const continuation = preSubmissionRecovery ? retained : message;
+    const prompt = neverSubmitted ?
+      taskPrompt(record.taskInput!.task, selected, record.taskInput!.context, record.taskInput!.contextText) +
+        (continuation !== undefined ? `\n\nContinuation task (takes precedence):\n${continuation}` : "") :
+      `${COOPERATION}\nAccess: ${record.access}\nContinuation task:\n${continuation}`;
+    await this.start(record, prompt, release);
     return record;
   }
   private async start(record: TaskRecord, prompt: string, reserved?: () => void): Promise<void> {
@@ -206,8 +269,26 @@ export class TaskManager {
       await rpc.request("prompt", { message: "/rpc-subagent-preflight" });
       this.assertOwnership();
       if (live.finishing || this.closed) throw new Error("Child failed during preflight");
+      if (record.version === 3) {
+        const run = record.roleRuns!.at(-1)!;
+        const result = JSON.parse(readFileSync(roleResultPath(record, this.store.dir), "utf8")) as RolePreflightResult;
+        if (!isDeepStrictEqual(result.binding, run.binding)) throw new Error("Role preflight result binding mismatch");
+        if (typeof result.error === "string") throw new Error(`Role preflight failed: ${result.error}`);
+        const snapshot = structuredClone(validateRoleSnapshot(result.snapshot, record.rolePlan!, run.binding, run.access));
+        const baseline = mergeRoleBaseline(record.roleBaseline!, snapshot);
+        if (this.closed || live.finishing || live.cancelRequested) throw new Error("Role task stopped before verified snapshot persistence");
+        run.snapshot = snapshot; run.status = "verified";
+        record.roleBaseline = baseline; record.loadout = snapshotRoleLoadout(record.rolePlan!, snapshot);
+        this.save(record); // Atomic role snapshot + cumulative verified baseline, before any model submission.
+      }
       phase = live.startupPhase = "initial prompt";
+      if (this.closed || live.finishing || live.cancelRequested) throw new Error("Task stopped before model submission");
+      if (record.version === 3) {
+        record.roleRuns!.at(-1)!.status = "submitting"; this.save(record);
+        if (this.closed || live.finishing || live.cancelRequested) throw new Error("Role task stopped before model submission");
+      }
       await rpc.request("prompt", { message: prompt });
+      if (record.version === 3) { record.roleRuns!.at(-1)!.status = "submitted"; this.save(record); }
       live.startupPhase = undefined;
       live.pendingMessages--;
       addLog(record, "Initial task accepted by RPC (not a completion acknowledgement)");
@@ -422,6 +503,7 @@ export class TaskManager {
             this.save(record, false); // Reserve the attempt durably before any new prompt.
             await this.continue(record.id,
               `Recover the interrupted task using the retained session history. First inspect existing results and partial tool effects. Do not blindly repeat side effects or treat interruption as rollback. Keep all original restrictions and finish only remaining work. Original task:\n${record.task}` +
+                (record.version === 3 && record.taskInput?.context === "partial" ? `\nOriginal selected parent context (saved before submission):\n${record.taskInput.contextText}` : "") +
                 (record.continuationTask ? `\nLatest continuation instruction (takes precedence):\n${record.continuationTask}` : "") +
                 (record.supplementaryInstructions?.length ? `\nSupplementary instructions submitted by the parent (receipt/execution may be unknown):\n${record.supplementaryInstructions.join("\n\n")}` : ""),
               record.access, undefined, true);
@@ -435,10 +517,11 @@ export class TaskManager {
           if (this.closed) break;
           if (record.run !== run) continue; // The replacement run owns its own cleanup/outcome now.
           const attempts = record.recovery?.attempts ?? 5;
-          record.recovery = { phase: attempts >= 5 ? "blocked" : "cleaning", attempts, error: String(error) };
-          record.activity = attempts >= 5 ? "automatically isolated after cleanup retries" : "automatic cleanup retry pending";
+          const isolated = attempts >= 5 || record.stopped && (record.recoveryRuns ?? 0) >= 1;
+          record.recovery = { phase: isolated ? "blocked" : "cleaning", attempts, error: String(error) };
+          record.activity = isolated ? "automatic continuation isolated" : "automatic cleanup retry pending";
           this.save(record);
-          if (attempts >= 5) this.options.notify?.(record, "result");
+          if (isolated) this.options.notify?.(record, "result");
         }
       }
     }).catch(() => { /* Ownership loss is fail-closed; shutdown owns remaining cleanup. */ })

@@ -1,7 +1,7 @@
 import type { Loadout } from "./loadout.ts";
 
 // Classify only known signals; retain the original error rather than guessing a cause.
-export function diagnoseFailure(error: string, loadout: Loadout, phase?: string): string {
+export function diagnoseFailure(error: string, loadout: Pick<Loadout, "model" | "agentDir">, phase?: string): string {
   let category: string, hint: string;
   if (/No API key found|missing api key|invalid api key|unauthorized|authentication failed|\b401\b/i.test(error)) {
     category = "credentials";

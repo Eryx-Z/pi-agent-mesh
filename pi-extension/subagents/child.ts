@@ -1,7 +1,25 @@
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { readFileSync } from "node:fs";
 import { validateLoadout, verifySkills, verifyTools } from "./loadout.ts";
+
+/** Register through the caller's API so Pi retains the caller's actual sourceInfo. */
+export function registerQuestionTool(pi: ExtensionAPI): ToolDefinition {
+  const parameters = Type.Object({ question: Type.String({ minLength: 1 }) });
+  const tool: ToolDefinition<typeof parameters> = {
+    name: "ask_question", label: "Ask parent", description: "Ask the parent a decision question. This tool blocks until the matching answer arrives.",
+    executionMode: "sequential", exposure: "model-only",
+    parameters,
+    async execute(_id, params, signal, _update, ctx) {
+      if (ctx.mode !== "rpc") throw new Error("ask_question requires the RPC parent bridge");
+      const answer = await ctx.ui.input(params.question, "Parent answer", { signal });
+      if (answer === undefined || signal?.aborted) throw new Error("Question cancelled without an answer");
+      return { content: [{ type: "text", text: answer }], details: {} };
+    },
+  };
+  pi.registerTool(tool);
+  return tool;
+}
 
 /** Only this bridge and source-backed inherited tool extensions are loaded in children. */
 export default function childBridge(pi: ExtensionAPI) {
@@ -11,17 +29,7 @@ export default function childBridge(pi: ExtensionAPI) {
   const allowed = new Set(loadout.tools);
   // Register after load-time conflict checks. This bridge is loaded first, so its
   // reserved question tool wins even when an inherited provider also defines it.
-  pi.on("session_start", () => { pi.registerTool({
-    name: "ask_question", label: "Ask parent", description: "Ask the parent a decision question. This tool blocks until the matching answer arrives.",
-    executionMode: "sequential", exposure: "model-only",
-    parameters: Type.Object({ question: Type.String({ minLength: 1 }) }),
-    async execute(_id, params, signal, _update, ctx) {
-      if (ctx.mode !== "rpc") throw new Error("ask_question requires the RPC parent bridge");
-      const answer = await ctx.ui.input(params.question, "Parent answer", { signal });
-      if (answer === undefined || signal?.aborted) throw new Error("Question cancelled without an answer");
-      return { content: [{ type: "text", text: answer }], details: {} };
-    },
-  }); });
+  pi.on("session_start", () => { registerQuestionTool(pi); });
   pi.registerCommand("rpc-subagent-preflight", {
     description: "Internal child loadout validation (no model call)",
     async handler(_args, ctx) {

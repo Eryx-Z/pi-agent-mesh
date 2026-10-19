@@ -4,16 +4,26 @@ import { randomUUID } from "node:crypto";
 import { validateLoadout, type Loadout, type AccessMode } from "./loadout.ts";
 import type { ContextMode } from "./context.ts";
 import type { ExecutionBoundary, ProcessIdentity } from "./execution.ts";
+import type { AgentMessage } from "./context.ts";
+import { rolePlanDigest, validateRolePlan, validateRoleSnapshot, mergeRoleBaseline, initialRoleLoadout, snapshotRoleLoadout,
+  type RolePlan, type RoleRun, type RoleToolSnapshot, type RoleRuntimeLoadout } from "./role-loadout.ts";
+import { isDeepStrictEqual } from "node:util";
 
 export type TaskState = "running" | "waiting" | "completed" | "failed" | "cancelled";
 export interface Question { id: string; title: string; toolCallId?: string; responseSent?: boolean }
+export interface TaskInput {
+  task: string; context: ContextMode; contextText?: string;
+  snapshot?: AgentMessage[]; parentSession?: string; cwd: string;
+}
 export interface TaskRecord {
-  version: 1 | 2; id: string; name: string; task: string; context: ContextMode;
+  version: 1 | 2 | 3; id: string; name: string; task: string; context: ContextMode;
   /** Legacy ownership is retained for inspection only; never inferred as access. */
   ownership?: string; access?: AccessMode; availableLoadout?: Loadout;
   workflow?: { id: string; stepId: string; attemptId?: string };
   state: TaskState; startedAt: number; updatedAt: number; sessionFile: string;
-  loadout: Loadout; output: string; activity: string; log: string[]; questions: Question[];
+  loadout: Loadout | RoleRuntimeLoadout; output: string; activity: string; log: string[]; questions: Question[];
+  /** V3 role authority and complete original input. Legacy records never infer a role. */
+  rolePlan?: RolePlan; taskInput?: TaskInput; roleRuns?: RoleRun[]; roleBaseline?: RoleToolSnapshot[];
   error?: string; stopped: boolean; run: number;
   /** Durable execution identity, separate from the task's terminal outcome. */
   execution?: { boundary: ExecutionBoundary; launcher?: ProcessIdentity; ready?: boolean;
@@ -63,20 +73,59 @@ export function uniqueName(base: string, names: string[]): string {
   for (let i = 2; names.includes(candidate); i++) candidate = `${base.slice(0, 64)}-${i}`;
   return candidate;
 }
+export function validateRoleRecord(record: TaskRecord): void {
+  const plan = validateRolePlan(record.rolePlan, { resources: false });
+  const input = record.taskInput;
+  if (!input || input.task !== record.task || input.context !== record.context || input.context !== plan.context || input.cwd !== plan.cwd ||
+      (input.parentSession !== undefined && typeof input.parentSession !== "string") ||
+      (input.context === "partial" ? typeof input.contextText !== "string" || !input.contextText.trim() : input.contextText !== undefined) ||
+      (input.context === "full" ? !Array.isArray(input.snapshot) || input.snapshot.some(m => !m || typeof m !== "object" || typeof m.role !== "string" || m.role === "system") : input.snapshot !== undefined)) {
+    throw new Error("Invalid persisted role TaskInput");
+  }
+  if (!Array.isArray(record.roleRuns) || record.roleRuns.length !== record.run || !Array.isArray(record.roleBaseline)) throw new Error("Invalid role run history");
+  const planHash = rolePlanDigest(plan), nonces = new Set<string>(), attempts = new Set<string>();
+  let baseline: RoleToolSnapshot[] = [];
+  for (const [index, run] of record.roleRuns.entries()) {
+    const b = run?.binding;
+    if (run?.version !== 1 || !b || b.taskId !== record.id || b.run !== index + 1 || b.planHash !== planHash ||
+        typeof b.nonce !== "string" || !b.nonce || nonces.has(b.nonce) || typeof b.attemptId !== "string" || !b.attemptId || attempts.has(b.attemptId) ||
+        !["read-only", "full"].includes(run.access) || !["planned", "verified", "submitting", "submitted"].includes(run.status) ||
+        (run.continuationMessage !== undefined && typeof run.continuationMessage !== "string") ||
+        (run.error !== undefined && typeof run.error !== "string") ||
+        (run.outcome !== undefined && !["running", "waiting", "completed", "failed", "cancelled"].includes(run.outcome)) ||
+        (run.cleanup !== undefined && !["pending", "confirmed"].includes(run.cleanup)) ||
+        (run.status === "planned" ? run.snapshot !== undefined : !run.snapshot)) throw new Error("Invalid persisted role run binding/state");
+    nonces.add(b.nonce); attempts.add(b.attemptId);
+    if (run.snapshot) {
+      validateRoleSnapshot(run.snapshot, plan, b, run.access);
+      baseline = mergeRoleBaseline(baseline, run.snapshot);
+    }
+  }
+  const current = record.roleRuns.at(-1)!;
+  const projected = current.snapshot ? snapshotRoleLoadout(plan, current.snapshot) : initialRoleLoadout(plan, current.access);
+  if (current.access !== record.access || !isDeepStrictEqual(baseline, record.roleBaseline) || !isDeepStrictEqual(record.loadout, projected) || record.availableLoadout !== undefined) {
+    throw new Error("Role task access/baseline/loadout mismatch");
+  }
+}
 export class TaskStore {
   constructor(readonly dir: string) { mkdirSync(dir, { recursive: true, mode: 0o700 }); }
   path(id: string): string {
     if (!/^[a-f0-9-]{36}$/.test(id)) throw new Error("Invalid task ID");
     return join(this.dir, `${id}.json`);
   }
-  save(record: TaskRecord): void { atomicWrite(this.path(record.id), JSON.stringify(record, null, 2)); }
+  save(record: TaskRecord): void {
+    if (record.version === 3) validateRoleRecord(record);
+    atomicWrite(this.path(record.id), JSON.stringify(record, null, 2));
+  }
   load(): TaskRecord[] {
     return readdirSync(this.dir).filter(f => /^[a-f0-9-]{36}\.json$/.test(f)).map(f => {
       const r = JSON.parse(readFileSync(join(this.dir, f), "utf8")) as TaskRecord;
-      if (![1, 2].includes(r.version) || `${r.id}.json` !== f || typeof r.name !== "string" || typeof r.task !== "string" ||
+      if (![1, 2, 3].includes(r.version) || `${r.id}.json` !== f || typeof r.name !== "string" || typeof r.task !== "string" ||
           (r.version === 1 ? typeof r.ownership !== "string" : !["read-only", "full"].includes(r.access ?? "")) || typeof r.sessionFile !== "string" ||
           !["none", "partial", "full"].includes(r.context) || !["running", "waiting", "completed", "failed", "cancelled"].includes(r.state) ||
           typeof r.stopped !== "boolean" || !Number.isInteger(r.run) || !Array.isArray(r.log) || !Array.isArray(r.questions)) throw new Error(`Invalid task record: ${f}`);
+      if (r.version === 3) validateRoleRecord(r);
+      else if (r.rolePlan || r.roleRuns || r.roleBaseline || r.taskInput || r.loadout?.version === 3) throw new Error(`Role data requires v3 task record: ${f}`);
       if (r.recovery && (!["cleaning", "resuming", "blocked"].includes(r.recovery.phase) ||
           !Number.isInteger(r.recovery.attempts) || r.recovery.attempts < 0 || r.recovery.attempts > 5)) throw new Error(`Invalid task recovery: ${f}`);
       if (r.recoveryRuns !== undefined && (!Number.isInteger(r.recoveryRuns) || r.recoveryRuns < 0 || r.recoveryRuns > 1)) throw new Error(`Invalid recovery budget: ${f}`);
@@ -101,8 +150,16 @@ export class TaskStore {
   }
   validateForContinue(r: TaskRecord): void {
     if (!terminal(r.state) || !r.stopped) throw new Error("Task is active or shutdown was not confirmed; continuation refused");
-    if (!existsSync(r.sessionFile)) throw new Error("Child session file is missing");
-    validateLoadout(r.loadout);
+    if (r.version === 3) {
+      validateRoleRecord(r);
+      // Only a task that has never submitted work may reconstruct its original seed.
+      // A later preflight failure cannot erase prior runs' side-effect/results history.
+      const possiblySubmitted = r.roleRuns!.some(run => ["submitting", "submitted"].includes(run.status));
+      if (!existsSync(r.sessionFile) && possiblySubmitted) throw new Error("Child session file is missing after possible model submission");
+    } else {
+      if (!existsSync(r.sessionFile)) throw new Error("Child session file is missing");
+      validateLoadout(r.loadout);
+    }
   }
   /** Reclaim is allowed only under the owner-wide kernel lease, after boundary cleanup. */
   lock(id: string, reclaim = false): () => void {

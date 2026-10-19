@@ -44,7 +44,7 @@ Automatic extension, skill, prompt-template and context-file (`AGENTS.md`/`CLAUD
 
 ## Role catalog preview (M1)
 
-**The catalog is available; PM activation and role-based dispatch are not implemented yet.** `enabled: true` currently enables configuration/catalog validation only. It does not change your main prompt, tool access, or the existing `subagent` / workflow API. Do not add a `role` argument to those APIs yet. Catalog queries require Pi **1.0.2+ (1.x)**; the existing non-role path keeps its prior version requirements. Keep the host's Pi dependency family aligned, not just its CLI/AI/TUI packages. A fresh install of those three at 1.0.2 can resolve incompatible 1.3.x `pi-agent-core` / `pi-codemode` / `pi-mcp` dependencies and fail before extension loading. For the tested 1.0.2 setup, align those packages and `@earendil-works/chord` to 1.0.2 as well.
+**The catalog is available; PM activation and public role-based dispatch are not implemented yet.** `enabled: true` currently enables configuration/catalog validation only. It does not change your main prompt, tool access, or the existing `subagent` / workflow API. Do not add a `role` argument to those APIs yet. Catalog queries require Pi **1.0.2+ (1.x)**; the existing non-role path keeps its prior version requirements. Keep the host's Pi dependency family aligned, not just its CLI/AI/TUI packages. A fresh install of those three at 1.0.2 can resolve incompatible 1.3.x `pi-agent-core` / `pi-codemode` / `pi-mcp` dependencies and fail before extension loading. For the tested 1.0.2 setup, align those packages and `@earendil-works/chord` to 1.0.2 as well.
 
 Create `<startup cwd>/.pi/agent-mesh.yaml` (or copy `examples/team/.pi/agent-mesh.yaml`):
 
@@ -69,6 +69,16 @@ Role references may also name manifest files relative to the team config's canon
 The package includes four independent role manifests, prompts, and skills: PM (reading/coordination), Builder (editing and shell), Tester (shell verification), Reviewer (`none` + read-only). These are declarations for future role execution, **not currently applied restrictions**. Shell access is not a sandbox. Custom manifests declare exact builtin tools, exact `SKILL.md` paths, MCP server/raw-tool references, and tool-only extension entries. Their availability and executable-tool contract are checked during future execution preflight, not by the passive catalog. See `roles/builder/role.yaml` and the two schemas for the full configuration shape.
 
 MCP config accepts stdio `command/args/cwd/env` or HTTP `url/headers`, plus timeout and description; exposure overrides, OAuth configuration, and credential-command evaluation are not accepted. Environment references remain unresolved in catalog snapshots; missing referenced variables are diagnosed without showing values. Role MCP never supplements its declarations from ambient `mcp.json`. This catalog guarantee does not disable the host's independently configured MCP extensions in an ordinary non-PM session.
+
+### Internal role execution engine (M2)
+
+The internal `TaskManager` now accepts a frozen `rolePlan` instead of an inherited loadout. This is not yet connected to the public `subagent` or workflow tools; continue using their existing parameters. MCP role execution is deferred to M3, and PM/public role integration to M4.
+
+The engine assembles only declared builtins, exact progressive skills, and selected local tools. It saves a private task/run/attempt/nonce-bound preflight result, validates actual tool definitions and sources, then persists a per-run snapshot and cumulative verified-definition baseline **before** submitting a model prompt. Exact active-tool and direct/nested call guards apply independently of parent capabilities. `read-only` does not import local tools or connect MCP; a full plan containing MCP fails explicitly in M2.
+
+Local tool entries must export a factory that only calls `pi.registerTool(...)` and returns void (or a promise of void). No hooks, commands, flags, providers, MCP registrations, `pi.exec`, or captured session APIs are allowed; tools use their `execute` context instead. A guarded factory adapter collects definitions in an isolated, never-bound loader and registers only selected tools as direct. Importing local JavaScript still executes trusted code: this is an API contract, **not a sandbox**. Pi 1.0.2 does not export `loadExtensions` from its package root; the adapter isolates access to its installed `dist/core/extensions/index.js`, covered by real RPC tests.
+
+V3 role records preserve original task/context input, the role body, authorized capabilities, and each run's effective access. Continuation does not reread the manifest or prompt. Skills and enabled local entry hashes, tool schemas and sources are rechecked; access tightening does not erase the verified baseline. A failed upgrade does not replace a valid snapshot. History remains readable after resource deletion. Before any possible submission, recovery can reconstruct the original session seed from saved input; after any run may have submitted work, a missing transcript is an error, not permission to replay it. These guarantees do not content-pin referenced scripts/packages or remote implementations.
 
 ## Tools
 
@@ -238,6 +248,8 @@ This intentionally disables the currently installed subagent extension for this 
 - `loadout.ts`: live runtime snapshots, canonical sources and inherited-loadout verification
 - `roles.ts`: passive team/role validation, canonical resource metadata, atomic catalog reload
 - `roles-ui.ts`: parent-only catalog preview commands and summaries (no PM activation)
+- `role-loadout.ts`: frozen role plans, actual snapshots, effective-access and historical-definition validation
+- `role-tools.ts` / `role-child.ts`: isolated local-tool selection and role-only child preflight/call guards
 - `context.ts`: none/partial/full snapshots and cooperation instructions
 - `rpc.ts`: JSONL framing, request correlation and process cleanup
 - `tasks.ts`: launch/control/question/completion lifecycle
