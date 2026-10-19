@@ -14,7 +14,7 @@ This is the **4.0.0 breaking redesign** of the earlier tmux implementation. Requ
 
 ## Three context modes
 
-Context controls information inheritance independently of tool access. There are no role definitions, profiles, or agent discovery:
+Context controls information inheritance independently of tool access. Current task execution uses inheritance, not role definitions or profiles; the optional role catalog below is a preview only:
 
 | Mode | Inherited parent conversation |
 | --- | --- |
@@ -41,6 +41,34 @@ Every new child receives a frozen snapshot of the parent's **active nondelegatio
 Automatic extension, skill, prompt-template and context-file (`AGENTS.md`/`CLAUDE.md`) discovery is disabled in children. Required project instructions belong in task/context. Pi's normal system-prompt configuration may still apply, with child cooperation guidance appended; the parent system prompt is not copied. Files backing skills/extensions are not content-pinned: continuation revalidates inventories and metadata, but implementation/body changes with unchanged metadata can change behavior.
 
 **No nested delegation:** this package's creation/management tools, legacy `subagent*` tools and conventional `spawn_agent`/`manage_agents`/`delegate_task` names are excluded. The CLI allowlist prevents providers from enabling extra tools, and the child entrypoint never registers parent controls. Pi has no semantic capability tags: arbitrary custom aliases and general shell tools are not a security sandbox. Do not expose disguised delegation tools; children are instructed not to delegate or launch agent CLIs. All inherited extension code and skills must remain trusted.
+
+## Role catalog preview (M1)
+
+**The catalog is available; PM activation and role-based dispatch are not implemented yet.** `enabled: true` currently enables configuration/catalog validation only. It does not change your main prompt, tool access, or the existing `subagent` / workflow API. Do not add a `role` argument to those APIs yet. Catalog queries require Pi **1.0.2+ (1.x)**; the existing non-role path keeps its prior version requirements. Keep the host's Pi dependency family aligned, not just its CLI/AI/TUI packages. A fresh install of those three at 1.0.2 can resolve incompatible 1.3.x `pi-agent-core` / `pi-codemode` / `pi-mcp` dependencies and fail before extension loading. For the tested 1.0.2 setup, align those packages and `@earendil-works/chord` to 1.0.2 as well.
+
+Create `<startup cwd>/.pi/agent-mesh.yaml` (or copy `examples/team/.pi/agent-mesh.yaml`):
+
+```yaml
+schema_version: 1
+enabled: true
+main_role: pm
+roles:
+  pm: builtin:pm
+  builder: builtin:builder
+  tester: builtin:tester
+  reviewer: builtin:reviewer
+mcp_servers: {}
+```
+
+Use `/roles` to list the selected roles, `/roles inspect builder` for declared resources, and `/roles reload` to validate and atomically replace the directory. The parent-only `roles_list` tool returns compact summaries. Queries do **not** import local tool modules, connect role MCP servers, or establish service readiness. Prompts and skills are read for validation, not injected into the main session.
+
+`PI_AGENT_MESH_CONFIG` selects an explicit path relative to startup cwd; otherwise only the default location is checked, with no upward search. The selection is captured at parent startup. A missing default or `enabled: false` yields a disabled catalog. An explicit missing path or invalid configuration is an error, not an empty successful directory. Failed reload retains the previous directory and reports the static error; reload does not change running tasks. Catalog loading is lazy until the first query, so ordinary legacy sessions do not load the new parser.
+
+Role references may also name manifest files relative to the team config's canonical directory. Manifest resource paths are relative to the canonical manifest directory. Once loaded, the canonical config identity stays fixed for reload; changing the selected file requires a new session. Roles are explicitly registered; neighboring files and directories are not scanned or merged. Unknown fields, duplicate names, mismatched IDs, missing resources, and malformed UTF-8/YAML are rejected with source/field diagnostics. Public JSON schemas in `schemas/` are also used by runtime validation.
+
+The package includes four independent role manifests, prompts, and skills: PM (reading/coordination), Builder (editing and shell), Tester (shell verification), Reviewer (`none` + read-only). These are declarations for future role execution, **not currently applied restrictions**. Shell access is not a sandbox. Custom manifests declare exact builtin tools, exact `SKILL.md` paths, MCP server/raw-tool references, and tool-only extension entries. Their availability and executable-tool contract are checked during future execution preflight, not by the passive catalog. See `roles/builder/role.yaml` and the two schemas for the full configuration shape.
+
+MCP config accepts stdio `command/args/cwd/env` or HTTP `url/headers`, plus timeout and description; exposure overrides, OAuth configuration, and credential-command evaluation are not accepted. Environment references remain unresolved in catalog snapshots; missing referenced variables are diagnosed without showing values. Role MCP never supplements its declarations from ambient `mcp.json`. This catalog guarantee does not disable the host's independently configured MCP extensions in an ordinary non-PM session.
 
 ## Tools
 
@@ -208,6 +236,8 @@ This intentionally disables the currently installed subagent extension for this 
 
 - `index.ts`: tools, session lifecycle, parent notifications
 - `loadout.ts`: live runtime snapshots, canonical sources and inherited-loadout verification
+- `roles.ts`: passive team/role validation, canonical resource metadata, atomic catalog reload
+- `roles-ui.ts`: parent-only catalog preview commands and summaries (no PM activation)
 - `context.ts`: none/partial/full snapshots and cooperation instructions
 - `rpc.ts`: JSONL framing, request correlation and process cleanup
 - `tasks.ts`: launch/control/question/completion lifecycle

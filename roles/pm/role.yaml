@@ -1,0 +1,13 @@
+schema_version: 1
+id: pm
+description: Clarify requirements, coordinate declared roles, and assess delivery evidence.
+system_prompt: './system.md'
+skills:
+  - ./skills/pm-planning/SKILL.md
+builtin_tools: [read, grep, find, ls]
+mcp: []
+extra_tools: []
+defaults:
+  model: inherit
+  context: partial
+  access: read-only

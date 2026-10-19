@@ -1,0 +1,13 @@
+schema_version: 1
+id: tester
+description: Run scoped verification and report commands, results, and reproducible failures.
+system_prompt: './system.md'
+skills:
+  - ./skills/tester-verification/SKILL.md
+builtin_tools: [read, grep, find, ls, bash]
+mcp: []
+extra_tools: []
+defaults:
+  model: inherit
+  context: partial
+  access: full

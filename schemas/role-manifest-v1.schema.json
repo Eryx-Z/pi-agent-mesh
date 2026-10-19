@@ -1,0 +1,55 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://pi-agent-mesh.dev/schemas/role-manifest-v1.schema.json",
+  "title": "Agent Mesh RoleManifestV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "id", "description", "system_prompt", "builtin_tools", "defaults"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "id": { "$ref": "#/definitions/id" },
+    "description": { "$ref": "#/definitions/nonempty" },
+    "system_prompt": { "$ref": "#/definitions/nonempty" },
+    "skills": { "type": "array", "uniqueItems": true, "items": { "$ref": "#/definitions/nonempty" } },
+    "builtin_tools": {
+      "type": "array", "uniqueItems": true,
+      "items": { "enum": ["read", "grep", "find", "ls", "edit", "write", "bash", "powershell"] }
+    },
+    "mcp": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["server", "tools"],
+        "properties": {
+          "server": { "$ref": "#/definitions/id" },
+          "tools": { "$ref": "#/definitions/tools" }
+        }
+      }
+    },
+    "extra_tools": {
+      "type": "array",
+      "items": {
+        "type": "object", "additionalProperties": false, "required": ["entry", "tools"],
+        "properties": {
+          "entry": { "$ref": "#/definitions/nonempty" },
+          "tools": { "$ref": "#/definitions/tools" }
+        }
+      }
+    },
+    "defaults": {
+      "type": "object", "additionalProperties": false, "required": ["access"],
+      "properties": {
+        "access": { "enum": ["read-only", "full"] },
+        "context": { "enum": ["none", "partial", "full"] },
+        "model": { "anyOf": [{ "const": "inherit" }, { "type": "string", "pattern": "^[^/\\s]+/[^\\s]+$" }] }
+      }
+    }
+  },
+  "definitions": {
+    "nonempty": { "type": "string", "pattern": "\\S" },
+    "id": {
+      "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "not": { "enum": ["__proto__", "constructor", "prototype"] }
+    },
+    "tools": { "type": "array", "uniqueItems": true, "items": { "type": "string", "pattern": "^[^\\s*]+$" } }
+  }
+}

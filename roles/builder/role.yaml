@@ -1,0 +1,13 @@
+schema_version: 1
+id: builder
+description: Implement scoped changes and report validation evidence and remaining work.
+system_prompt: './system.md'
+skills:
+  - ./skills/builder-delivery/SKILL.md
+builtin_tools: [read, grep, find, ls, edit, write, bash]
+mcp: []
+extra_tools: []
+defaults:
+  model: inherit
+  context: partial
+  access: full

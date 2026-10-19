@@ -1,0 +1,13 @@
+schema_version: 1
+id: reviewer
+description: Independently audit requirements and code using read-only evidence.
+system_prompt: './system.md'
+skills:
+  - ./skills/reviewer-audit/SKILL.md
+builtin_tools: [read, grep, find, ls]
+mcp: []
+extra_tools: []
+defaults:
+  model: inherit
+  context: none
+  access: read-only

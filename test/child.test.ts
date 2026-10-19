@@ -45,14 +45,16 @@ test('parent extension exposes discoverable control/UI; cannot register spawning
   const tools: any[] = [], commands: string[] = [], events: string[] = [];
   const api = { on: (name: string) => events.push(name), registerTool: (t: any) => tools.push(t), registerCommand: (name: string) => commands.push(name), registerMessageRenderer() {} } as any;
   entry(api);
-  assert.deepEqual(tools.map(t => t.name), ['subagent', 'subagent_control', 'workflow_run', 'workflow_control']);
+  assert.deepEqual(tools.map(t => t.name), ['roles_list', 'subagent', 'subagent_control', 'workflow_run', 'workflow_control']);
+  assert.ok(commands.includes('roles'));
   assert.ok(commands.includes('subagents')); assert.ok(events.includes('session_shutdown'));
-  assert.equal(tools[0].parameters.properties.contextText.type, 'string');
-  assert.equal(tools[0].parameters.properties.agent, undefined);
-  assert.equal(tools[0].parameters.properties.ownership, undefined);
-  assert.ok(tools[0].parameters.required.includes('access'));
+  const subagent = tools.find(t => t.name === 'subagent');
+  assert.equal(subagent.parameters.properties.contextText.type, 'string');
+  assert.equal(subagent.parameters.properties.agent, undefined);
+  assert.equal(subagent.parameters.properties.ownership, undefined);
+  assert.ok(subagent.parameters.required.includes('access'));
   assert.ok(commands.includes('workflows'));
-  assert.equal(tools[0].parameters.additionalProperties, false);
+  assert.equal(subagent.parameters.additionalProperties, false);
   const previous = process.env.PI_RPC_SUBAGENT_CHILD;
   process.env.PI_RPC_SUBAGENT_CHILD = '1';
   try { entry({} as any); }

@@ -1,0 +1,56 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://pi-agent-mesh.dev/schemas/team-config-v1.schema.json",
+  "title": "Agent Mesh TeamConfigV1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "enabled"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "enabled": { "type": "boolean" },
+    "main_role": { "$ref": "#/definitions/id" },
+    "roles": {
+      "type": "object", "propertyNames": { "$ref": "#/definitions/id" },
+      "additionalProperties": { "$ref": "#/definitions/nonempty" }
+    },
+    "mcp_servers": {
+      "type": "object", "propertyNames": { "$ref": "#/definitions/id" },
+      "additionalProperties": { "oneOf": [{ "$ref": "#/definitions/stdio" }, { "$ref": "#/definitions/http" }] }
+    }
+  },
+  "if": { "properties": { "enabled": { "const": true } }, "required": ["enabled"] },
+  "then": { "properties": { "roles": {} }, "required": ["roles"] },
+  "definitions": {
+    "nonempty": { "type": "string", "pattern": "\\S" },
+    "id": {
+      "type": "string", "pattern": "^[a-z0-9][a-z0-9_-]{0,63}$",
+      "not": { "enum": ["__proto__", "constructor", "prototype"] }
+    },
+    "strings": {
+      "type": "object", "propertyNames": { "not": { "enum": ["__proto__", "constructor", "prototype"] } },
+      "additionalProperties": { "type": "string" }
+    },
+    "stdio": {
+      "type": "object", "additionalProperties": false, "required": ["command"],
+      "properties": {
+        "type": { "const": "stdio" },
+        "command": { "type": "string", "pattern": "^(?:[^\\s;&|`$<>]+|(?:\\.?\\.?/|/|[A-Za-z]:[\\\\/])[^;&|`$<>]+)$" },
+        "args": { "type": "array", "items": { "type": "string" } },
+        "cwd": { "$ref": "#/definitions/nonempty" },
+        "env": { "$ref": "#/definitions/strings" },
+        "timeout": { "type": "number", "exclusiveMinimum": 0 },
+        "description": { "type": "string" }
+      }
+    },
+    "http": {
+      "type": "object", "additionalProperties": false, "required": ["url"],
+      "properties": {
+        "type": { "const": "http" },
+        "url": { "type": "string", "pattern": "^https?://[^\\s]+$" },
+        "headers": { "$ref": "#/definitions/strings" },
+        "timeout": { "type": "number", "exclusiveMinimum": 0 },
+        "description": { "type": "string" }
+      }
+    }
+  }
+}

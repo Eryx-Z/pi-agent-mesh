@@ -11,6 +11,7 @@ import { WorkflowManager, workflowSummary } from "./workflows.ts";
 import { detail, resultRenderer, taskMenu, taskSummary, widget, TaskWidget } from "./ui.ts";
 import type { AgentMessage } from "./context.ts";
 import { closeDashboards } from "./dashboard.ts";
+import { registerRoles } from "./roles-ui.ts";
 
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
 const accessSchema = () => StringEnum(["read-only", "full"] as const);
@@ -26,6 +27,7 @@ const stepSchema = Type.Object({
 }, { additionalProperties: false });
 export default function subagentsExtension(pi: ExtensionAPI) {
   if (process.env.PI_RPC_SUBAGENT_CHILD === "1") return;
+  registerRoles(pi);
   let manager: TaskManager | undefined;
   let workflows: WorkflowManager | undefined;
   let ctxForWidget: ExtensionContext | undefined;

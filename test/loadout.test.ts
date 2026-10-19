@@ -72,7 +72,7 @@ test("read-only drops custom tools and extension overrides; full preserves inher
 test("empty parent active set remains empty except ask_question; delegation names are excluded", () => {
   const t = setup();
   try {
-    const names = ["subagent", "subagent_message", "subagents_list", "subagent_control", "spawn_agent", "manage_agents", "agent_spawn", "delegate_task", "mcp_subagent_launch"];
+    const names = ["subagent", "subagent_message", "subagents_list", "subagent_control", "spawn_agent", "manage_agents", "agent_spawn", "delegate_task", "mcp_subagent_launch", "roles_list"];
     assert.ok(names.every(isDelegationTool));
     assert.ok(!isDelegationTool("read")); assert.ok(!isDelegationTool("ask_question"));
     for (const active of [[], names]) {
