@@ -7,6 +7,7 @@ import { atomicWrite, addLog, bounded, uniqueName, terminal, TaskStore, type Tas
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
 import { diagnoseFailure } from "./diagnostics.ts";
+import { classifyToolOutcome, observationText, type MeshObserver, type TaskEventName } from "./observability.ts";
 import { SystemdExecutionController, readProcessIdentity, isProcessIdentityAlive, type ExecutionController } from "./execution.ts";
 import { acquireExecutionLease, type ExecutionLease } from "./lease.ts";
 import { isDeepStrictEqual } from "node:util";
@@ -33,6 +34,8 @@ interface ManagerOptions {
   /** Live parent trust, never persisted; absent means untrusted for role local/MCP resources. */
   isProjectTrusted?: () => boolean;
   changed?: () => void; notify?: (record: TaskRecord, kind: "result" | "question") => void;
+  /** Must not affect execution; TaskManager swallows observer failures. */
+  observe?: MeshObserver;
   /** Tests may shorten delays; production retries are bounded and back off. */
   recoveryDelayMs?: number;
   /** One absolute role startup/readiness deadline. Tests can shorten it. */
@@ -186,6 +189,7 @@ export class TaskManager {
       seedSession(record.sessionFile, record.loadout.cwd, input.context, input.snapshot, input.parentSession);
       this.save(record);
     } catch (e) { this.records.delete(id); throw e; }
+    this.watchTask(record, "launched");
     await this.start(record, prompt);
     return record;
   }
@@ -230,6 +234,7 @@ export class TaskManager {
       this.save(record);
     }
     catch (e) { release(); record.state = "failed"; record.stopped = true; throw e; }
+    this.watchTask(record, automatic ? "recovered" : "continued");
     const retained = record.roleRuns?.at(-1)?.continuationMessage;
     const continuation = preSubmissionRecovery ? retained : message;
     const prompt = neverSubmitted ?
@@ -303,6 +308,7 @@ export class TaskManager {
         record.roleBaseline = baseline; record.loadout = snapshotRoleLoadout(record.rolePlan!, snapshot);
         this.save(record); // Atomic role snapshot + cumulative verified baseline, before any model submission.
       }
+      this.watchTask(record, "preflight_ok");
       phase = live.startupPhase = "initial prompt";
       if (this.closed || live.finishing || live.cancelRequested) throw new Error("Task stopped before model submission");
       if (record.version === 3) {
@@ -316,14 +322,46 @@ export class TaskManager {
       addLog(record, "Initial task accepted by RPC (not a completion acknowledgement)");
       this.save(record); this.maybeComplete(record, live);
     } catch (e) {
-      if (spawned) await this.finish(record, "failed", String(e));
+      const message = String(e);
+      if (phase === "loadout preflight" || /preflight/i.test(message)) this.watchTask(record, "preflight_failed", message, phase);
+      if (spawned) await this.finish(record, "failed", message);
       else {
-        release?.(); record.state = "failed"; record.error = diagnoseFailure(String(e), record.loadout, phase); record.stopped = true;
+        release?.(); record.state = "failed"; record.error = diagnoseFailure(message, record.loadout, phase); record.stopped = true;
         if (record.execution) { record.execution.intent = "failed"; record.execution.cleanup = "confirmed"; }
+        this.watchTask(record, "failed", record.error, phase);
         this.save(record);
       }
-      throw new Error(diagnoseFailure(String(e), record.loadout, phase), { cause: e });
+      throw new Error(diagnoseFailure(message, record.loadout, phase), { cause: e });
     }
+  }
+  private watch(fn: () => void): void {
+    try { fn(); } catch { /* Observability must not change execution. */ }
+  }
+  private watchTask(record: TaskRecord, event: TaskEventName, error?: string, phase?: string): void {
+    this.watch(() => {
+      const roleId = record.rolePlan?.roleId;
+      const common = { taskId: record.id, roleId, workflowId: record.workflow?.id, stepId: record.workflow?.stepId,
+        access: record.access, context: record.context, model: record.rolePlan?.model ?? record.loadout.model, version: record.version, run: record.run, error, phase };
+      this.options.observe?.task({ event, ...common });
+      const roleEvent = event === "launched" ? "created" as const : event === "continued" ? "continued" as const : event === "recovered" ? "recovered" as const
+        : event === "completed" || event === "failed" || event === "cancelled" || event === "question" || event === "answered" || event === "preflight_ok" || event === "preflight_failed" ? event : undefined;
+      if (roleId && roleEvent) this.options.observe?.role({ event: roleEvent, ...common, roleId });
+    });
+  }
+  private watchTool(record: TaskRecord, phase: "start" | "end", event: RpcEvent): void {
+    this.watch(() => {
+      const observe = this.options.observe;
+      if (!observe) return;
+      const name = typeof event.toolName === "string" && event.toolName ? event.toolName : "unknown";
+      const toolCallId = typeof event.toolCallId === "string" && event.toolCallId ? event.toolCallId : name;
+      const key = `child:${record.id}:${toolCallId}`;
+      const sample = { origin: "child" as const, nested: typeof event.parentToolCallId === "string" && !!event.parentToolCallId, name, toolCallId,
+        taskId: record.id, roleId: record.rolePlan?.roleId, workflowId: record.workflow?.id, stepId: record.workflow?.stepId, run: record.run };
+      if (phase === "start") { observe.beginTool?.(key, sample); return; }
+      const error = event.isError ? observationText(event.result) : undefined;
+      const finished = { ...sample, outcome: classifyToolOutcome(event.isError === true, error), error, durationMs: typeof event.durationMs === "number" ? event.durationMs : undefined };
+      if (observe.endTool) observe.endTool(key, finished); else observe.tool(finished);
+    });
   }
   private event(record: TaskRecord, live: LiveRun, event: RpcEvent): void {
     if (live.finishing || this.closed) return;
@@ -343,6 +381,7 @@ export class TaskManager {
       if (event.toolName === "ask_question") live.askToolCallId = event.toolCallId;
       record.activity = `${event.toolName}: ${bounded(JSON.stringify(event.args ?? {}), 200)}`;
       addLog(record, `Start ${event.toolCallId}: ${record.activity}`);
+      this.watchTool(record, "start", event);
     }
     if (event.type === "tool_execution_update") record.activity = `${event.toolName}: ${bounded(text(event.partialResult), 200)}`;
     if (event.type === "tool_execution_end") {
@@ -353,6 +392,7 @@ export class TaskManager {
       }
       if (event.toolName === "ask_question") live.askToolCallId = undefined;
       addLog(record, `${event.isError ? "Failed" : "Done"} ${event.toolName} (${event.toolCallId}): ${text(event.result)}`);
+      this.watchTool(record, "end", event);
       if (event.toolName === "ask_question") record.questions = record.questions.filter(q => q.toolCallId !== event.toolCallId);
       record.state = record.questions.length ? "waiting" : "running";
       record.activity = record.questions.length ? "waiting for parent answer" : "model running";
@@ -364,6 +404,7 @@ export class TaskManager {
           if (!live.askToolCallId) throw new Error("Unsolicited child dialog; only ask_question input is supported");
           record.questions.push({ id: event.id, title: event.title, toolCallId: live.askToolCallId });
           record.state = "waiting"; record.activity = "waiting for parent answer";
+          this.watchTask(record, "question");
           this.save(record); this.options.notify?.(record, "question");
         }
       } else if (["select", "confirm", "editor"].includes(event.method)) {
@@ -421,6 +462,8 @@ export class TaskManager {
       record.state = live.cancelRequested ? "cancelled" : state;
       record.error = live.cancelRequested ? "Cancelled by parent" : error;
       record.questions = []; record.activity = "stopping process";
+      if (record.state === "completed" || record.state === "failed" || record.state === "cancelled") this.watchTask(record, record.state, record.error, live.startupPhase);
+      this.watch(() => this.options.observe?.abandonTools?.(`child:${record.id}:`));
       if (record.execution) record.execution.intent = !live.cancelRequested && interrupted ? "interrupted" : record.state;
       let persistenceError: unknown;
       try { this.save(record, false); } catch (e) { persistenceError = e; }
@@ -549,7 +592,7 @@ export class TaskManager {
           record.recovery = { phase: isolated ? "blocked" : "cleaning", attempts, error: String(error) };
           record.activity = isolated ? "automatic continuation isolated" : "automatic cleanup retry pending";
           this.save(record);
-          if (isolated) this.options.notify?.(record, "result");
+          if (isolated) { this.watchTask(record, "recovery_blocked", String(error)); this.options.notify?.(record, "result"); }
         }
       }
     }).catch(() => { /* Ownership loss is fail-closed; shutdown owns remaining cleanup. */ })
@@ -573,10 +616,11 @@ export class TaskManager {
       await live.rpc.request("prompt", { message: `Supplementary parent instruction:\n${message}`, streamingBehavior: "steer" });
       // Queued receipts do not prove history persistence/execution; retain directives
       // until an explicit new continuation supersedes this run.
-      addLog(record, `Supplement accepted/queued (not yet proven executed): ${message}`); this.save(record);
+      addLog(record, `Supplement accepted/queued (not yet proven executed): ${message}`); this.watchTask(record, "message"); this.save(record);
     } catch (e) {
       // Do not strand a formerly settled run after clearing its settled flag.
       // A failed control operation stops this writer rather than guessing whether to retry.
+      this.watchTask(record, "message_rejected", String(e));
       await this.finish(record, "failed", `Supplement failed: ${String(e)}`);
       throw e;
     } finally { live.pendingMessages--; this.maybeComplete(record, live); }
@@ -588,7 +632,7 @@ export class TaskManager {
     if (!live || live.finishing || !q || q.responseSent) throw new Error("Question is no longer pending");
     live.rpc.send({ type: "extension_ui_response", id: questionId, value: answer });
     q.responseSent = true; record.activity = "answer sent; waiting for tool acknowledgement";
-    addLog(record, `Answer sent for ${questionId}: ${answer}`); this.save(record);
+    addLog(record, `Answer sent for ${questionId}: ${answer}`); this.watchTask(record, "answered"); this.save(record);
   }
   async cancel(id: string): Promise<void> {
     const record = this.get(id), live = this.live.get(record.id);
@@ -602,6 +646,7 @@ export class TaskManager {
       this.save(record, false);
     }
     if (live) await this.finish(record, "cancelled", "Cancelled by parent");
+    else this.watchTask(record, "cancelled", "Cancelled by parent");
     if (!record.stopped) throw new Error(`Cancellation could not confirm shutdown; automatic cleanup pending: ${record.recovery?.error ?? record.error ?? "unknown stop failure"}`);
   }
   fenceRecovery(): void {

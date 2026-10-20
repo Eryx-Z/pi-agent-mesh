@@ -29,12 +29,15 @@ export interface RoleCatalogAccess {
   current(ctx: ExtensionContext): Promise<RoleCatalog>;
   pin(ctx: ExtensionContext, configPath: string): void;
   summary(ctx: ExtensionContext): Promise<string>;
+  setObserver?(observer: ((event: { action: "load" | "reload"; outcome: "success" | "error"; error?: string }) => void) | undefined): void;
 }
 export function registerRoles(pi: ExtensionAPI): RoleCatalogAccess | undefined {
   if (process.env.PI_RPC_SUBAGENT_CHILD === "1") return;
   let startup: { cwd: string; explicitPath: string } | undefined;
   let pending: Promise<RoleCatalog> | undefined;
   let restoredPath: string | undefined;
+  let observer: ((event: { action: "load" | "reload"; outcome: "success" | "error"; error?: string }) => void) | undefined;
+  const seen = (event: { action: "load" | "reload"; outcome: "success" | "error"; error?: string }) => { try { observer?.(event); } catch { /* Catalog queries stay passive. */ } };
   const capture = (ctx: ExtensionContext) => {
     startup ??= { cwd: ctx.cwd ?? process.cwd(), explicitPath: process.env.PI_AGENT_MESH_CONFIG ?? "" };
   };
@@ -48,17 +51,23 @@ export function registerRoles(pi: ExtensionAPI): RoleCatalogAccess | undefined {
     capture(ctx);
     // Keep the old no-role runtime free of new parser/native-MCP dependencies.
     pending ??= (async () => {
-      const version = JSON.parse(readFileSync(join(getPackageDir(), "package.json"), "utf8")).version as string;
-      const [major, minor, patch] = version.split(".").map(Number);
-      if (!(major === 1 && (minor > 0 || minor === 0 && patch >= 2))) {
-        throw new Error("Role catalog requires Pi 1.0.2 or newer (1.x); legacy non-role calls remain available.");
+      try {
+        const version = JSON.parse(readFileSync(join(getPackageDir(), "package.json"), "utf8")).version as string;
+        const [major, minor, patch] = version.split(".").map(Number);
+        if (!(major === 1 && (minor > 0 || minor === 0 && patch >= 2))) {
+          throw new Error("Role catalog requires Pi 1.0.2 or newer (1.x); legacy non-role calls remain available.");
+        }
+        const { RoleCatalog } = await import("./roles.ts");
+        return new RoleCatalog(startup!.cwd, restoredPath ?? startup!.explicitPath);
+      } catch (error) {
+        seen({ action: "load", outcome: "error", error: error instanceof Error ? error.message : String(error) });
+        throw error;
       }
-      const { RoleCatalog } = await import("./roles.ts");
-      return new RoleCatalog(startup!.cwd, restoredPath ?? startup!.explicitPath);
     })();
     const catalog = await pending;
     if (!catalog.current && !catalog.error) {
-      try { catalog.reload(); } catch { /* Show parser diagnostics, not a misleading empty-success directory. */ }
+      try { catalog.reload(); seen({ action: "load", outcome: "success" }); }
+      catch { seen({ action: "load", outcome: "error", error: catalog.error }); /* Show parser diagnostics, not a misleading empty-success directory. */ }
     }
     return catalog;
   }
@@ -71,8 +80,8 @@ export function registerRoles(pi: ExtensionAPI): RoleCatalogAccess | undefined {
         let text: string;
         if (!words.length) text = listing(catalog);
         else if (words.length === 1 && words[0] === "reload") {
-          try { catalog.reload(); text = `Role directory reloaded.\n${listing(catalog)}`; }
-          catch { text = `Reload failed; ${catalog.current ? "kept the previous valid directory" : "no previous valid directory"}.\n${listing(catalog)}`; }
+          try { catalog.reload(); seen({ action: "reload", outcome: "success" }); text = `Role directory reloaded.\n${listing(catalog)}`; }
+          catch { seen({ action: "reload", outcome: "error", error: catalog.error }); text = `Reload failed; ${catalog.current ? "kept the previous valid directory" : "no previous valid directory"}.\n${listing(catalog)}`; }
         } else if (words.length === 2 && words[0] === "inspect") {
           const role = catalog.current?.roles.find(role => role.id === words[1]);
           if (!role) throw new Error(`Role not found: ${words[1]}${catalog.error ? `; ${catalog.error}` : ""}`);
@@ -96,5 +105,5 @@ export function registerRoles(pi: ExtensionAPI): RoleCatalogAccess | undefined {
   return { current, pin(ctx, configPath) {
     capture(ctx);
     if ((restoredPath ?? startup!.explicitPath) !== configPath) { restoredPath = configPath; pending = undefined; }
-  }, async summary(ctx) { return listing(await current(ctx)); } };
+  }, async summary(ctx) { return listing(await current(ctx)); }, setObserver(fn) { observer = fn; } };
 }

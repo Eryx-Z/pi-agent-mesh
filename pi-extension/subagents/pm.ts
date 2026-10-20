@@ -44,7 +44,7 @@ function retainPmFailure(ctx: ExtensionContext, error: string): string {
 }
 
 /** Session-scoped PM state. All mesh-owned wakeups route through this gate. */
-export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, options: { readinessMs?: number } = {}) {
+export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, options: { readinessMs?: number; observe?: (event: { state: "off" | "initializing" | "ready" | "failed"; error?: string }) => void } = {}) {
   const readinessMs = options.readinessMs ?? 30000;
   if (!Number.isSafeInteger(readinessMs) || readinessMs < 1 || readinessMs > 30000) throw new Error("PM readinessMs must be 1–30000");
   let state: "off" | "initializing" | "ready" | "failed" = "off", error = "";
@@ -61,8 +61,13 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
     const current = generation;
     setImmediate(() => { if (current === generation) { turnPending = false; flush(); } });
   });
+  const publish = (next: typeof state, nextError = error) => {
+    if (next === state && nextError === error) return;
+    state = next; error = nextError;
+    try { options.observe?.({ state: next, error: nextError || undefined }); } catch { /* Observability must not affect readiness. */ }
+  };
   const fail = (cause: unknown) => {
-    state = "failed"; error = cause instanceof Error ? cause.message : String(cause); pi.setActiveTools([]);
+    publish("failed", cause instanceof Error ? cause.message : String(cause)); pi.setActiveTools([]);
     context?.ui.notify(`PM not ready: ${error}. Inspect /roles and start a new session after fixing resources.`, "error");
     context?.ui.setStatus("agent-mesh-role", "PM failed");
   };
@@ -115,7 +120,7 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
     });
   }
   async function stop() {
-    generation++; abort.abort(); pending = []; turnPending = false; state = "off"; context = undefined;
+    generation++; abort.abort(); pending = []; turnPending = false; publish("off"); context = undefined;
     for (const unsubscribe of hooks.splice(0)) unsubscribe();
     local?.dispose(); local = undefined;
     // Pi model selection has no cancellation API and commits after async auth.
@@ -140,13 +145,13 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
       pending.push(message); flush();
     },
     async start(ctx: ExtensionContext) {
-      const stopped = stop(); state = "initializing"; context = ctx;
+      const stopped = stop(); publish("initializing", ""); context = ctx;
       await stopped; context = ctx; error = ""; abort = new AbortController();
       const current = ++generation, deadline = Date.now() + readinessMs;
       const deadlineAbort = new AbortController();
       const timer = setTimeout(() => deadlineAbort.abort(new Error("PM readiness deadline expired")), readinessMs);
       const signal = AbortSignal.any([abort.signal, deadlineAbort.signal]);
-      const legacy = () => { state = "off"; for (const message of pending.splice(0)) pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true }); };
+      const legacy = () => { publish("off", ""); for (const message of pending.splice(0)) pi.sendMessage(message, { deliverAs: "steer", triggerTurn: true }); };
       try {
         const entry = [...ctx.sessionManager.getBranch()].reverse().find(e => e.type === "custom" && e.customType === PM_ENTRY);
         const previous = entry?.type === "custom" ? entry.data as PmSnapshot : undefined;
@@ -226,7 +231,7 @@ export function createTeamRuntime(pi: ExtensionAPI, catalog: RoleCatalogAccess, 
         const next: PmSnapshot = { version: 1, plan: active, planHash: rolePlanDigest(active), configPath: saved?.configPath ?? directory.configPath, tools, management: runtimeTools,
           piVersion: JSON.parse(readFileSync(join(getPackageDir(), "package.json"), "utf8")).version, promptVersion: 1 };
         if (!saved) pi.appendEntry(PM_ENTRY, copy(next));
-        saved = copy(next); state = "ready"; ctx.ui.setStatus("agent-mesh-role", `PM ${active.roleId} ready`);
+        saved = copy(next); publish("ready", ""); ctx.ui.setStatus("agent-mesh-role", `PM ${active.roleId} ready`);
         if (directory.error) ctx.ui.notify(`PM restored; new role dispatch unavailable: ${directory.error}. Fix the directory and use /roles reload.`, "warning");
         flush();
       } catch (cause) {

@@ -294,6 +294,16 @@ An owner-wide cap defaults to **8 child tasks**, configurable through `PI_SUBAGE
 
 All executable local code and selected servers must be trusted. Hashes freeze the manifest, role body, skill files and local entrypoints, **not** their transitive scripts/packages or remote implementations. Tool access is not OS isolation. Natural-language verdicts are not machine-enforced acceptance; no automatic repair rounds, automatic application/merge, role marketplace or cross-task MCP connection pool is provided. Native MCP request timeouts (which progress may reset) are not total task deadlines. The offline demo proves deterministic plumbing, not real-model reasoning or your provider's authentication.
 
+## Observability
+
+`/mesh` shows counters and a bounded recent-event ring for the current parent session. The same snapshot is written to `<session dir>/rpc-subagents/<session id>/observability.json`, and a one-line summary is published as the `agent-mesh-metrics` status. Recorded detail includes:
+
+- parent, child and nested tool calls by name: count, success, error, blocked and aborted outcomes, duration min/avg/max/last, plus per-role and control-action breakdowns
+- role creations, continuations, recoveries, standalone versus workflow, access/context/model, preflight and terminal outcomes, questions and answers
+- task launches and outcomes, workflow scheduling transitions, PM readiness, catalog load/reload and parent turn stop reasons
+
+Tool arguments, tool results and prompts are omitted. Error text is truncated and redacted; do not treat the file as a secret store or a transcript. A blocked call is not counted as success. Calls still in flight when the process reloads are marked aborted, not successful. `/mesh tools`, `/mesh roles`, `/mesh events 50` and `/mesh json` select a section. This is a read-only snapshot, not a control, and it is intentionally not a management tool so saved PM snapshots remain compatible.
+
 ## Development and isolated trial
 
 ```bash
@@ -330,6 +340,7 @@ This intentionally disables the currently installed subagent extension for this 
 - `store.ts`: durable records, bounded previews and session locks
 - `child.ts`: blocking question tool and loadout preflight
 - `ui.ts`: main widget, task menu and result rendering
+- `observability.ts`: session counters, bounded event ring and `/mesh` report
 
 Role profiles, `agents/`, the `agent` launch argument, `subagents_list` and bundled profile-only `safe_bash` are removed. Existing profile directories are ignored, not modified. Legacy v1 profile loadouts remain inspectable but cannot be continued; launch a new context-based task instead. The former tmux/Claude plugin registries are not migrated or automatically resumed.
 

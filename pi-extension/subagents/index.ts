@@ -16,6 +16,7 @@ import { createTeamRuntime, installMainMcpRouter } from "./pm.ts";
 import { resolveRoleDispatch, selectedModel } from "./role-dispatch.ts";
 import { ROLE_MAIN_EXTENSION, type RolePlan } from "./role-loadout.ts";
 import type { StepDefinition } from "./workflows.ts";
+import { Observability, classifyToolOutcome, observationText } from "./observability.ts";
 
 const result = (text: string) => ({ content: [{ type: "text" as const, text: bounded(text, 16000) }], details: {} });
 const accessSchema = () => StringEnum(["read-only", "full"] as const);
@@ -45,7 +46,9 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
     return;
   }
   const catalog = registerRoles(pi)!;
-  const team = createTeamRuntime(pi, catalog);
+  let mesh: Observability | undefined;
+  const parentActions = new Map<string, string>();
+  const team = createTeamRuntime(pi, catalog, { observe: event => mesh?.control({ event: "pm", name: event.state, outcome: event.state, error: event.error }) });
   pi.on("input", (_event, ctx) => team.input(ctx));
   let manager: TaskManager | undefined;
   let workflows: WorkflowManager | undefined;
@@ -78,13 +81,29 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
     const value = mode === "full" ? snapshots.get(id) ?? snapshotContext(ctx.sessionManager) : undefined;
     snapshots.delete(id); return value;
   }
+  function publishMesh(ctx?: ExtensionContext) {
+    const target = ctx ?? ctxForWidget;
+    if (!mesh || !target) return;
+    try {
+      const totals = mesh.totals();
+      const idle = totals.toolCalls === 0 && totals.rolesCreated === 0 && totals.tasksLaunched === 0;
+      target.ui.setStatus("agent-mesh-metrics", idle ? "mesh idle" : `mesh ${totals.toolSuccesses}/${totals.toolCalls} ok · roles ${totals.rolesCreated} · fail ${totals.toolFailures}`);
+    } catch { /* Status is advisory. */ }
+  }
+  function safeMesh(fn: () => void) { try { fn(); } catch { /* Observability must not affect the parent turn. */ } }
   pi.on("session_start", async (_event, ctx) => {
-    const startup = team.start(ctx);
     closeDashboards();
     if (interval) clearInterval(interval);
     interval = undefined;
     ctx.ui.setWidget("rpc-subagents", undefined);
-    if (!ctx.sessionManager.getSessionFile()) { await startup; return; }
+    try { ctx.ui.setStatus("agent-mesh-metrics", undefined); } catch { /* Status is advisory. */ }
+    safeMesh(() => { mesh?.abandonTools("parent:"); mesh?.flush(); });
+    parentActions.clear();
+    mesh = new Observability();
+    mesh.onUpdate = () => publishMesh(ctx);
+    catalog.setObserver?.(event => mesh?.control({ event: "catalog", name: event.action, outcome: event.outcome, error: event.error }));
+    const startup = team.start(ctx);
+    if (!ctx.sessionManager.getSessionFile()) { await startup; publishMesh(ctx); return; }
     const display = new TaskWidget();
     ctxForWidget = ctx;
     // Host imports are mapped by Pi's loader; native module resolution cannot locate them.
@@ -96,6 +115,7 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
       maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
       command: process.execPath, baseArgs: [cli],
       isProjectTrusted: () => ctx.isProjectTrusted(),
+      observe: mesh,
       notify(record, kind) {
         if (kind === "result") display.result(record);
         const content = kind === "question"
@@ -104,36 +124,73 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
         team.notify({ customType: `rpc_subagent_${kind}`, content, display: true, details: { id: record.id, state: record.state } });
       },
     });
+    mesh.attach(dir, ctx.sessionManager.getSessionId());
     workflows = new WorkflowManager(manager, join(dir, "workflows"), r => {
       team.notify({ customType: "rpc_workflow_result", content: `${workflowSummary(r)}\nStep completion is not independent acceptance; inspect reports and validation.`, display: true, details: { id: r.id, state: r.state } });
-    });
+    }, mesh);
     manager.startRecovery();
     interval = setInterval(() => { if (manager && ctxForWidget) widget(manager, ctxForWidget, display); }, 500);
     widget(manager, ctx, display);
+    publishMesh(ctx);
     await startup;
   });
   pi.on("session_shutdown", async () => {
     closeDashboards();
     if (interval) clearInterval(interval);
     interval = undefined; snapshots.clear(); promptOptions = undefined;
-    ctxForWidget?.ui.setWidget("rpc-subagents", undefined);
+    const widgetCtx = ctxForWidget;
+    widgetCtx?.ui.setWidget("rpc-subagents", undefined);
     const old = manager, oldFlows = workflows;
     old?.fenceRecovery();
     manager = undefined; workflows = undefined; ctxForWidget = undefined;
     // Native model authentication can be unbounded. Drain it before replacement,
     // but start owned-worker cleanup immediately and await both even on errors.
-    const stopped = await Promise.allSettled([
-      team.stop(),
-      (async () => { try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); } })(),
-    ]);
-    const failed = stopped.find(r => r.status === "rejected");
-    if (failed?.status === "rejected") throw failed.reason;
+    let failure: unknown;
+    try {
+      const stopped = await Promise.allSettled([
+        team.stop(),
+        (async () => { try { await oldFlows?.shutdown(); } finally { await old?.shutdown(); } })(),
+      ]);
+      const failed = stopped.find(r => r.status === "rejected");
+      if (failed?.status === "rejected") failure = failed.reason;
+    } finally {
+      safeMesh(() => { mesh?.abandonTools("parent:"); mesh?.abandonTools("child:"); mesh?.flush(); });
+      mesh = undefined; parentActions.clear();
+      try { widgetCtx?.ui.setStatus("agent-mesh-metrics", undefined); } catch { /* Status is advisory. */ }
+    }
+    if (failure) throw failure;
   });
   pi.on("tool_call", (event, ctx) => {
     if (event.toolName === "workflow_run" || event.toolName === "workflow_control" && event.input?.action === "update" || event.toolName === "subagent") snapshots.set(event.toolCallId, snapshotContext(ctx.sessionManager));
-    return team.toolCall(event.toolName, event.parentToolCallId);
+    if ((event.toolName === "subagent_control" || event.toolName === "workflow_control") && typeof event.input?.action === "string") parentActions.set(event.toolCallId, event.input.action);
+    const decision = team.toolCall(event.toolName, event.parentToolCallId);
+    if (decision && typeof decision === "object" && "block" in decision && decision.block) {
+      const reason = "reason" in decision && typeof decision.reason === "string" ? decision.reason : "blocked";
+      safeMesh(() => mesh?.markBlocked(`parent:${event.toolCallId}`, reason));
+    }
+    return decision;
   });
-  pi.on("tool_execution_end", event => { snapshots.delete(event.toolCallId); });
+  pi.on("tool_execution_start", event => {
+    safeMesh(() => mesh?.beginTool(`parent:${event.toolCallId}`, {
+      origin: "parent", nested: !!event.parentToolCallId, name: event.toolName, action: parentActions.get(event.toolCallId), toolCallId: event.toolCallId,
+    }));
+  });
+  pi.on("tool_execution_end", event => {
+    snapshots.delete(event.toolCallId);
+    const action = parentActions.get(event.toolCallId);
+    parentActions.delete(event.toolCallId);
+    safeMesh(() => {
+      const error = event.isError ? observationText(event.result) : undefined;
+      mesh?.endTool(`parent:${event.toolCallId}`, {
+        origin: "parent", nested: !!event.parentToolCallId, name: event.toolName, action,
+        outcome: classifyToolOutcome(event.isError, error), error, durationMs: "durationMs" in event && typeof event.durationMs === "number" ? event.durationMs : undefined, toolCallId: event.toolCallId,
+      });
+    });
+  });
+  pi.on("agent_end", event => {
+    const assistant = [...event.messages].reverse().find(message => message.role === "assistant") as { stopReason?: string } | undefined;
+    safeMesh(() => mesh?.control({ event: "agent", name: "parent_turn", outcome: assistant?.stopReason ?? "unknown" }));
+  });
   pi.registerTool({
     name: "subagent", label: "Subagent",
     description: "Launch an asynchronous RPC subagent in the shared working directory. Optional role selects independently configured capabilities and defaults. Without role, access is required: read-only (verified builtin read/grep/find/ls only, plus ask_question) or full (parent active nondelegation tools). Tool filtering is not a sandbox. Context: none, partial (default; requires contextText), full (frozen active branch). Results/questions arrive automatically. Use subagent_control for history, questions, follow-up and continuation.",
@@ -227,6 +284,21 @@ export default async function subagentsExtension(pi: ExtensionAPI) {
     async handler(args, ctx) {
       try { await taskMenu(current(), ctx, args.trim() || undefined); }
       catch (e) { ctx.ui.notify(String(e), "error"); }
+    },
+  });
+  pi.registerCommand("mesh", {
+    description: "Inspect plugin observability: /mesh [tools|roles|tasks|workflows|controls|events [n]|json]",
+    async handler(args, ctx) {
+      try {
+        if (!mesh) throw new Error("Observability requires an active session");
+        const words = args.trim().split(/\s+/).filter(Boolean);
+        if (words.length > 2) throw new Error("Usage: /mesh [tools|roles|tasks|workflows|controls|events [n]|json]");
+        const section = words[0] ?? "all";
+        const limit = words[1] === undefined ? undefined : Number(words[1]);
+        const text = section === "json" ? mesh.toJSON(limit ?? 80) : mesh.report(section, limit);
+        if (ctx.hasUI) await ctx.ui.editor("Agent mesh observability (read-only snapshot)", text);
+        else ctx.ui.notify(text, "info");
+      } catch (error) { ctx.ui.notify(error instanceof Error ? error.message : String(error), "error"); }
     },
   });
   pi.registerCommand("workflows", {

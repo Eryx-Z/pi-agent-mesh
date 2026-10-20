@@ -47,6 +47,7 @@ test('parent extension exposes discoverable control/UI; cannot register spawning
   await entry(api);
   assert.deepEqual(tools.map(t => t.name), ['roles_list', 'subagent', 'subagent_control', 'workflow_run', 'workflow_control']);
   assert.ok(commands.includes('roles'));
+  assert.ok(commands.includes('mesh'));
   assert.ok(commands.includes('subagents')); assert.ok(events.includes('session_shutdown'));
   const subagent = tools.find(t => t.name === 'subagent');
   assert.equal(subagent.parameters.properties.contextText.type, 'string');
