@@ -53,7 +53,8 @@ async function setup(cleanup: ExecutionController['cleanup'] = async () => {}) {
     store.save(record); writeFileSync(`${store.path(id)}.lock`, JSON.stringify({ token: 'stale', pid: child.pid }));
     return record;
   }
-  async function open(recoveryDelayMs = 10, maxConcurrent = 8) {
+  async function open(recoveryDelayMs = 10, maxConcurrent = 8,
+    onRequest?: (phase: 'before' | 'accepted', type: string, fields?: Record<string, unknown>) => void) {
     const manager = await TaskManager.open(store, {
       command: process.execPath, executionController: controller, recoveryDelayMs, maxConcurrent,
       notify: (record, kind) => notifications.push({ id: record.id, run: record.run, kind }),
@@ -70,7 +71,8 @@ async function setup(cleanup: ExecutionController['cleanup'] = async () => {}) {
         const request = rpc.request.bind(rpc);
         rpc.request = (type, fields) => {
           if (type === 'prompt' && typeof fields?.message === 'string') prompts.push(fields.message);
-          return request(type, fields);
+          onRequest?.('before', type, fields);
+          return request(type, fields).then(result => { onRequest?.('accepted', type, fields); return result; });
         };
         return rpc;
       },
@@ -272,6 +274,105 @@ test('interrupted task resumes exactly once with retained history and durable at
   } finally { await t.clean(); }
 });
 
+for (const checkpoint of ['before-readiness', 'preflight', 'submission-uncertain', 'accepted-without-transcript'] as const) {
+  test(`standalone partial ${checkpoint} checkpoint recovers original restrictions without another budget`, linux, async () => {
+    const t = await setup();
+    const contextText = '  ORIGINAL_SELECTED_CONTEXT\nOnly inspect src/auth.ts; do not edit files or inspect credentials.\n保留边界。  ';
+    let saved: TaskRecord | undefined;
+    try {
+      const first = await t.open(10, 8, (phase, type, fields) => {
+        const match = checkpoint === 'before-readiness' ? phase === 'before' && type === 'get_state' :
+          checkpoint === 'preflight' ? phase === 'before' && fields?.message === '/rpc-subagent-preflight' :
+          phase === (checkpoint === 'submission-uncertain' ? 'before' : 'accepted') && type === 'prompt' && fields?.message !== '/rpc-subagent-preflight';
+        if (match && !saved) {
+          const path = [...first.records.values()][0].id;
+          saved = JSON.parse(readFileSync(t.store.path(path), 'utf8'));
+        }
+      });
+      const original = await first.launch({ task: 'SCENARIO_HOLD: inspect auth', context: 'partial', contextText,
+        access: 'read-only', loadout: loadout(t.dir) });
+      assert.ok(saved, 'Capture the real durable launch checkpoint');
+      const transcript = readFileSync(original.sessionFile, 'utf8');
+      assert.equal(transcript.trim().split('\n').length, 1, 'Fake RPC deliberately leaves only the original session header');
+      await first.shutdown();
+      // Replay the captured owner-death checkpoint, not graceful shutdown's terminal state.
+      // The real launcher has now exited, so the existing controller can prove cleanup.
+      t.store.save(saved); writeFileSync(`${t.store.path(saved.id)}.lock`, 'stale checkpoint');
+      const priorPrompts = t.prompts.length;
+      const recovered = await t.open(); recovered.startRecovery(); recovered.startRecovery();
+      const record = recovered.get(original.id);
+      await until(() => record.run === 2 && record.log.some(line => line.includes('Initial task accepted by RPC')));
+      const prompts = t.prompts.slice(priorPrompts).filter(prompt => prompt !== '/rpc-subagent-preflight');
+      assert.equal(prompts.length, 1);
+      assert.ok(prompts[0].includes(contextText), 'Recovery must include the exact original partial selection even without a persisted first user prompt');
+      assert.match(prompts[0], /Do not blindly repeat side effects/);
+      assert.match(prompts[0], /Access: read-only/);
+      assert.equal(record.access, 'read-only'); assert.deepEqual(record.loadout.tools, ['read', 'ask_question']);
+      assert.equal(record.version, 2); assert.equal(record.taskInput, undefined);
+      const durable = JSON.parse(readFileSync(t.store.path(record.id), 'utf8'));
+      assert.deepEqual(durable.recoveryContext, { version: 1, contextText });
+      assert.equal(durable.recoveryRuns, 1);
+      assert.equal(readFileSync(record.sessionFile, 'utf8'), transcript, 'Recovery must not reseed or overwrite retained history');
+      recovered.startRecovery(); await sleep(40);
+      assert.equal(record.run, 2); assert.equal(record.recoveryRuns, 1); assert.equal(t.starts, 2);
+      await recovered.cancel(record.id); await recovered.shutdown();
+      const reopened = await t.open(); reopened.startRecovery(); await sleep(40);
+      assert.equal(reopened.get(record.id).recoveryRuns, 1); assert.equal(t.starts, 2);
+    } finally { await t.clean(); }
+  });
+}
+
+test('explicit standalone partial continuation retains saved scope before the latest instruction', linux, async () => {
+  const t = await setup();
+  const contextText = 'ORIGINAL_SCOPE: inspect auth only; no edits';
+  try {
+    const first = await t.open();
+    const original = await first.launch({ task: 'inspect', context: 'partial', contextText, access: 'read-only', loadout: loadout(t.dir) });
+    await until(() => original.stopped); await first.shutdown();
+    const restored = await t.open();
+    const message = 'LATEST_EXPLICIT_INSTRUCTION: explain findings only';
+    const record = await restored.continue(original.id, message);
+    await until(() => record.stopped);
+    const prompt = t.prompts.filter(prompt => prompt !== '/rpc-subagent-preflight').at(-1)!;
+    assert.ok(prompt.includes(contextText));
+    assert.ok(prompt.indexOf(contextText) < prompt.indexOf(message), 'Latest continuation must retain its established precedence');
+    assert.equal(record.access, 'read-only'); assert.equal(record.recoveryRuns, 0);
+    assert.equal(record.taskInput, undefined); assert.equal(record.version, 2);
+  } finally { await t.clean(); }
+});
+
+for (const version of [1, 2] as const) {
+  test(`legacy v${version} partial continuation accepts absent recovery context without inventing restrictions`, linux, async () => {
+    const t = await setup();
+    try {
+      const old = t.seed('completed'); old.context = 'partial'; old.stopped = true;
+      old.version = version; old.access = 'read-only'; old.execution!.cleanup = 'confirmed';
+      if (version === 1) { old.ownership = 'historical scope, not authority'; delete old.access; }
+      t.store.save(old);
+      const manager = await t.open();
+      const record = await manager.continue(old.id, 'explain existing results', 'read-only');
+      await until(() => record.stopped);
+      const prompt = t.prompts.filter(prompt => prompt !== '/rpc-subagent-preflight').at(-1)!;
+      assert.doesNotMatch(prompt, /Original selected parent context|historical scope, not authority/);
+      assert.equal(record.version, 2); assert.equal(record.access, 'read-only');
+      assert.equal(JSON.parse(readFileSync(t.store.path(record.id), 'utf8')).recoveryContext, undefined);
+    } finally { await t.clean(); }
+  });
+}
+
+test('legacy v2 partial automatic recovery does not require or fabricate an unavailable selection', linux, async () => {
+  const t = await setup();
+  try {
+    const old = t.seed(); old.context = 'partial'; old.access = 'read-only'; t.store.save(old);
+    const manager = await t.open(); manager.startRecovery();
+    const record = manager.get(old.id); await until(() => record.stopped && record.run === 2);
+    assert.equal(record.state, 'completed'); assert.equal(record.access, 'read-only'); assert.equal(record.recoveryRuns, 1);
+    const prompt = t.prompts.filter(prompt => prompt !== '/rpc-subagent-preflight').at(-1)!;
+    assert.doesNotMatch(prompt, /Original selected parent context/);
+    assert.equal(JSON.parse(readFileSync(t.store.path(record.id), 'utf8')).recoveryContext, undefined);
+  } finally { await t.clean(); }
+});
+
 for (const intent of ['cancelled', 'completed'] as const) {
   test(`${intent} cleanup never re-executes the task`, linux, async () => {
     const t = await setup();
@@ -311,6 +412,45 @@ for (const missing of ['launcher', 'legacy'] as const) {
       await until(() => record.recovery?.phase === 'blocked');
       assert.equal(calls, 0); assert.equal(t.starts, 0); assert.equal(record.stopped, false);
       assert.ok(existsSync(`${t.store.path(old.id)}.lock`));
+    } finally { await t.clean(); }
+  });
+}
+
+test('workflow partial recovery still requires explicit workflow continuation and retains original selection', linux, async () => {
+  const t = await setup();
+  const contextText = 'WORKFLOW_PARTIAL_SCOPE: only inspect the assigned worktree';
+  const workflow = { id: randomUUID(), stepId: 'step', attemptId: randomUUID() };
+  try {
+    const first = await t.open();
+    const original = await first.launch({ task: 'SCENARIO_HOLD', context: 'partial', contextText,
+      access: 'read-only', workflow, loadout: loadout(t.dir) });
+    await first.shutdown();
+    const restored = await t.open(); restored.startRecovery();
+    const record = restored.get(original.id);
+    await until(() => record.stopped); await sleep(40);
+    assert.equal(record.run, 1); assert.equal(record.recoveryRuns ?? 0, 0); assert.equal(t.starts, 1);
+    await assert.rejects(restored.continue(record.id, 'finish'), /Use workflow_control retry/);
+    const before = t.prompts.length;
+    await restored.continue(record.id, 'LATEST_WORKFLOW_INSTRUCTION: inspect existing effects only', undefined, workflow.id);
+    const prompt = t.prompts.slice(before).find(prompt => prompt !== '/rpc-subagent-preflight')!;
+    assert.ok(prompt.includes(contextText));
+    assert.ok(prompt.indexOf(contextText) < prompt.indexOf('LATEST_WORKFLOW_INSTRUCTION'));
+    assert.equal(record.access, 'read-only'); assert.equal(record.recoveryRuns, 0);
+    assert.deepEqual(record.workflow, workflow);
+    await until(() => record.stopped);
+  } finally { await t.clean(); }
+});
+
+for (const context of ['none', 'full'] as const) {
+  test(`new non-role ${context} task does not acquire a partial recovery selection`, linux, async () => {
+    const t = await setup();
+    try {
+      const manager = await t.open();
+      const record = await manager.launch({ task: 'inspect', context, access: 'read-only', loadout: loadout(t.dir) });
+      await until(() => record.stopped);
+      const durable = JSON.parse(readFileSync(t.store.path(record.id), 'utf8'));
+      assert.equal(durable.recoveryContext, undefined); assert.equal(durable.taskInput, undefined);
+      assert.equal(durable.version, 2);
     } finally { await t.clean(); }
   });
 }

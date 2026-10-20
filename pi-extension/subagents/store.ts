@@ -30,6 +30,8 @@ export interface TaskRecord {
     intent: TaskState | "interrupted"; cleanup: "pending" | "confirmed" };
   recovery?: { phase: "cleaning" | "resuming" | "blocked"; attempts: number; error?: string };
   recoveryRuns?: number;
+  /** V2 partial selection saved before submission; absent on legacy records, never inferred. */
+  recoveryContext?: { version: 1; contextText: string };
   continuationTask?: string;
   supplementaryInstructions?: string[];
 }
@@ -107,6 +109,15 @@ export function validateRoleRecord(record: TaskRecord): void {
     throw new Error("Role task access/baseline/loadout mismatch");
   }
 }
+function validateRecoveryContext(record: TaskRecord): void {
+  const context = record.recoveryContext;
+  if (context === undefined) return; // Legacy records have no recoverable selection.
+  if (record.version !== 2 || record.context !== "partial" || !context || typeof context !== "object" || Array.isArray(context) ||
+      Object.keys(context).length !== 2 || Object.keys(context).some(key => !["version", "contextText"].includes(key)) ||
+      context.version !== 1 || typeof context.contextText !== "string" || !context.contextText.trim()) {
+    throw new Error("Invalid persisted recovery context (requires v2 partial task and version 1 contextText)");
+  }
+}
 export class TaskStore {
   constructor(readonly dir: string) { mkdirSync(dir, { recursive: true, mode: 0o700 }); }
   path(id: string): string {
@@ -114,6 +125,7 @@ export class TaskStore {
     return join(this.dir, `${id}.json`);
   }
   save(record: TaskRecord): void {
+    validateRecoveryContext(record);
     if (record.version === 3) validateRoleRecord(record);
     atomicWrite(this.path(record.id), JSON.stringify(record, null, 2));
   }
@@ -124,6 +136,7 @@ export class TaskStore {
           (r.version === 1 ? typeof r.ownership !== "string" : !["read-only", "full"].includes(r.access ?? "")) || typeof r.sessionFile !== "string" ||
           !["none", "partial", "full"].includes(r.context) || !["running", "waiting", "completed", "failed", "cancelled"].includes(r.state) ||
           typeof r.stopped !== "boolean" || !Number.isInteger(r.run) || !Array.isArray(r.log) || !Array.isArray(r.questions)) throw new Error(`Invalid task record: ${f}`);
+      validateRecoveryContext(r);
       if (r.version === 3) validateRoleRecord(r);
       else if (r.rolePlan || r.roleRuns || r.roleBaseline || r.taskInput || r.loadout?.version === 3) throw new Error(`Role data requires v3 task record: ${f}`);
       if (r.recovery && (!["cleaning", "resuming", "blocked"].includes(r.recovery.phase) ||
@@ -150,6 +163,7 @@ export class TaskStore {
   }
   validateForContinue(r: TaskRecord): void {
     if (!terminal(r.state) || !r.stopped) throw new Error("Task is active or shutdown was not confirmed; continuation refused");
+    validateRecoveryContext(r);
     if (r.version === 3) {
       validateRoleRecord(r);
       // Only a task that has never submitted work may reconstruct its original seed.

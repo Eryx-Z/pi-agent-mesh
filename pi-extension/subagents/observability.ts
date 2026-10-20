@@ -9,8 +9,15 @@ const MAX_ROLES = 48;
 const MAX_EVENTS = 400;
 const MAX_BREAKDOWN = 16;
 const MAX_TEXT = 240;
+const MAX_JSON_CHARACTERS = 64_000;
 const MAX_DURATION_MS = 24 * 60 * 60 * 1000;
-const SECRET = /(?:bearer\s+)[a-z0-9._~+/=-]{8,}|\b(?:sk|rk)-[a-z0-9_-]{8,}|\bAKIA[0-9A-Z]{16}\b|[?&](?:access_)?token=[^&\s]+|((?:api[_-]?key|access[_-]?key|token|secret|password|passwd|authorization|credential)\s*[:=]\s*)\S+/gi;
+// Locate fields, not their values: bounded scanning below distinguishes quoted
+// values, JSON containers and full Authorization header lines. Credential suffixes
+// intentionally have no leading word boundary (HTTP_AUTHORIZATION, refreshToken,
+// DB_PASSWORD); their unmatched prefixes remain readable. Matching query tokens in
+// the same pass lets an enclosing quoted credential take precedence.
+const SECRET_FIELD = /[?&](?:access_)?token=|(["']?(authorization|api[\s_-]*key|access[\s_-]*(?:key|token)|client[\s_-]*secret|token|secret|password|passwd|credentials?)["']?\s*[:=]\s*)/gi;
+const SECRET = /(?:bearer|basic)\s+[a-z0-9._~+/=-]{8,}|\b(?:sk|rk)-[a-z0-9_-]{8,}|\bAKIA[0-9A-Z]{16}\b/gi;
 
 export type ToolOrigin = "parent" | "child";
 export type ToolOutcome = "success" | "error" | "blocked" | "aborted";
@@ -89,10 +96,166 @@ const iso = (value: number) => Number.isFinite(value) && value > 0 ? new Date(va
 const rate = (ok: number, calls: number) => calls ? `${Math.round((ok / calls) * 1000) / 10}%` : "n/a";
 const clock = (value: number) => !Number.isFinite(value) ? "n/a" : value < 1000 ? `${Math.round(value)}ms` : `${(value / 1000).toFixed(1)}s`;
 
+interface TextStructure { containers: string[]; quote?: string }
+const isQuote = (char: string | undefined) => char === '"' || char === "'";
+const isMarker = (text: string, at: number) => text.slice(at, at + 10).toLowerCase() === "[redacted]";
+function quotedEnd(text: string, start: number, limit = text.length): number {
+  const quote = text[start];
+  for (let i = start + 1; i < limit; i++) {
+    if (text[i] === "\\") i++;
+    else if (text[i] === quote) return i + 1;
+  }
+  return limit; // Truncated/unclosed quoted values remain entirely private.
+}
+function skipSpace(text: string, at: number): number {
+  while (at < text.length && /\s/.test(text[at])) at++;
+  return at;
+}
+function nextObjectField(text: string, comma: number): boolean {
+  const key = skipSpace(text, comma + 1);
+  return isQuote(text[key]) && text[skipSpace(text, quotedEnd(text, key))] === ":";
+}
+function objectValueBoundary(text: string, at: number): boolean {
+  // A closing brace attached to further secret text is part of the value, not
+  // an object ending. Marker validation and credential scanning must agree.
+  return (text[at] === "}" && (at + 1 === text.length || /[\s,}\]]/.test(text[at + 1])))
+    || (text[at] === "," && nextObjectField(text, at));
+}
+// Track only surrounding structure, never interpreting a credential's contents as
+// containers. [redacted] is an opaque atom, not a JSON array. All scans operate on
+// the already bounded (4000 character) input and advance monotonically.
+function advanceStructure(text: string, from: number, to: number, state: TextStructure): void {
+  const root = skipSpace(text, 0);
+  for (let i = from; i < to; i++) {
+    const char = text[i];
+    if (state.quote) {
+      if (char === "\\") i++;
+      else if (char === state.quote) state.quote = undefined;
+    } else if (isMarker(text, i)) i += 9;
+    // A quoted scalar can also be the whole message. Do not treat arbitrary
+    // quotes in unstructured diagnostics or key="value" as enclosing strings.
+    else if (isQuote(char) && (state.containers.length || i === root)) state.quote = char;
+    else if (char === "{" || char === "[") state.containers.push(char);
+    else if ((char === "}" && state.containers.at(-1) === "{") || (char === "]" && state.containers.at(-1) === "[")) state.containers.pop();
+  }
+}
+function collectionEnd(text: string, start: number): number {
+  const state: TextStructure = { containers: [text[start]] };
+  for (let i = start + 1; i < text.length; i++) {
+    // Quoted blocks are skipped whole so escaped brackets cannot close a value.
+    if (isMarker(text, i)) i += 9;
+    else if (isQuote(text[i])) i = quotedEnd(text, i) - 1;
+    else {
+      advanceStructure(text, i, i + 1, state);
+      if (!state.containers.length) return i + 1;
+    }
+  }
+  return text.length;
+}
+function safeHeaderMarkerBoundary(text: string, at: number, structured: boolean): boolean {
+  while (at < text.length) {
+    const next = skipSpace(text, at);
+    if (next === at) return false; // An attached tail is always part of the header.
+    if (next === text.length) return true;
+    if (structured && objectValueBoundary(text, next)) return true;
+    let end = next;
+    let name: string;
+    if (isQuote(text[next])) {
+      end = quotedEnd(text, next);
+      name = text.slice(next + 1, end - 1);
+    } else {
+      while (end < text.length && /[\w.-]/.test(text[end])) end++;
+      name = text.slice(next, end);
+    }
+    const separator = skipSpace(text, end);
+    if (text[separator] !== ":" && text[separator] !== "=") return false;
+    // Newlines are normalized after redaction. Preserve only these explicit,
+    // non-credential diagnostic fields on subsequent passes, not arbitrary header
+    // parameters (e.g. response=...). Unknown tails and all schemes stay private.
+    const value = skipSpace(text, separator + 1);
+    const diagnostic = name.toLowerCase();
+    if (diagnostic === "status" || diagnostic === "code") {
+      const quoted = isQuote(text[value]);
+      let valueEnd = value;
+      if (quoted) {
+        valueEnd = quotedEnd(text, value);
+        if (text[valueEnd - 1] !== text[value]) return false;
+      } else {
+        while (valueEnd < text.length && /[\w.-]/.test(text[valueEnd])) valueEnd++;
+      }
+      const atom = text.slice(value + (quoted ? 1 : 0), valueEnd - (quoted ? 1 : 0));
+      if (!/^[\w.-]+$/.test(atom)) return false;
+      at = valueEnd;
+    } else {
+      if (!name || !isMarker(text, value)) return false;
+      at = value + 10;
+    }
+    if (structured && objectValueBoundary(text, at)) return true;
+    // Validate the complete remaining suffix, not just one redacted field before
+    // an unknown tail. In particular, a comma cannot hide a new Basic scheme.
+  }
+  return true;
+}
+function credentialEnd(text: string, start: number, authorization: boolean, state: TextStructure): number {
+  if (isQuote(text[start])) return quotedEnd(text, start);
+  const structured = !state.quote && state.containers.at(-1) === "{";
+  const marker = isMarker(text, start);
+  if (structured && !marker && (text[start] === "{" || text[start] === "[")) return collectionEnd(text, start);
+  let at = marker ? start + 10 : start;
+  if (authorization && marker && safeHeaderMarkerBoundary(text, at, structured)) return at;
+  if (!authorization && !marker) {
+    const scheme = /^(?:bearer|basic)\s+/i.exec(text.slice(start));
+    if (scheme) at += scheme[0].length;
+  }
+  const newline = authorization ? text.indexOf("\n", start) : -1;
+  const limit = newline < 0 ? text.length : newline;
+  for (; at < limit; at++) {
+    const char = text[at];
+    if (!authorization && /\s/.test(char)) break;
+    if (structured && (at > start || char === ",") && objectValueBoundary(text, at)) break;
+    if (state.quote) {
+      if (char === "\\") at++;
+      else if (char === state.quote) break;
+    } else if (isQuote(char)) at = quotedEnd(text, at, limit) - 1;
+  }
+  return at;
+}
+function queryEnd(text: string, start: number, state: TextStructure): number {
+  for (let at = start; at < text.length; at++) {
+    const char = text[at];
+    // Escaped quotes/backslashes belong to the URL string. An unescaped closing
+    // quote belongs to its containing field, never to this query parameter.
+    if (char === "\\") { at++; continue; }
+    if (char === "&" || /\s/.test(char)) return at;
+    if (state.quote ? char === state.quote : isQuote(char) || char === "}" || char === "]" || (char === "," && nextObjectField(text, at))) return at;
+  }
+  return text.length;
+}
+function redactCredentialFields(text: string): string {
+  const state: TextStructure = { containers: [] };
+  const parts: string[] = [];
+  let copied = 0, scanned = 0;
+  SECRET_FIELD.lastIndex = 0;
+  for (let match; (match = SECRET_FIELD.exec(text));) {
+    const start = SECRET_FIELD.lastIndex;
+    advanceStructure(text, scanned, start, state);
+    const end = match[1] ? credentialEnd(text, start, match[2].toLowerCase() === "authorization", state) : queryEnd(text, start, state);
+    parts.push(text.slice(copied, match.index), match[1] ?? "", end > start || !match[1] ? "[redacted]" : "");
+    // A match inside an unrelated quoted string may consume its closing quote.
+    // Otherwise credential contents are opaque, so braces in secrets never alter
+    // the surrounding container stack used for subsequent fields.
+    if (state.quote) advanceStructure(text, start, end, state);
+    scanned = copied = SECRET_FIELD.lastIndex = end;
+  }
+  parts.push(text.slice(copied));
+  return parts.join("");
+}
+
 export function sanitizeObservation(value: unknown, max = MAX_TEXT): string | undefined {
   if (value === undefined || value === null) return;
   const raw = (typeof value === "string" ? value : value instanceof Error ? value.message : String(value)).slice(0, 4000);
-  const cleaned = raw.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, " ").replace(SECRET, (match, prefix: string | undefined) => prefix ? `${prefix}[redacted]` : "[redacted]").replace(/\s+/g, " ").trim();
+  const cleaned = redactCredentialFields(raw.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, " "))
+    .replace(SECRET, "[redacted]").replace(/\s+/g, " ").trim();
   if (!cleaned) return;
   return cleaned.length > max ? `${cleaned.slice(0, max - 1)}…` : cleaned;
 }
@@ -237,7 +400,7 @@ export class Observability implements MeshObserver {
     if (!REPORT_SECTIONS.includes(section as ReportSection)) throw new Error("Usage: /mesh [tools|roles|tasks|workflows|controls|events [n]|json]");
     const shown = this.eventLimit(limit);
     const selected = section as ReportSection;
-    const lines = [this.header(), ""];
+    const lines = [...this.header(), ""];
     if (selected === "all" || selected === "tools") lines.push(...this.toolLines(), "");
     if (selected === "all" || selected === "roles") lines.push(...this.roleLines(), "");
     if (selected === "all" || selected === "tasks") lines.push(...this.taskLines(), "");
@@ -249,8 +412,30 @@ export class Observability implements MeshObserver {
   toJSON(limit = 80): string {
     const snap = this.persisted();
     snap.events = snap.events.slice(-this.eventLimit(limit));
-    const text = JSON.stringify(snap, null, 2);
-    return text.length > 64000 ? `${text.slice(0, 64000)}\n…[truncated]` : text;
+    let text = JSON.stringify(snap, null, 2);
+    if (text.length <= MAX_JSON_CHARACTERS) return text;
+
+    // Only exports are reduced; persistence and live counters remain complete.
+    // Whole categories keep the fallback cheap and avoid presenting partial rows
+    // as complete statistics. Omission counts refer to the requested snapshot.
+    const omitted: Partial<Record<"events" | "inflight" | "tools" | "roles" | "controls" | "tasks" | "workflows" | "byWorkspace" | "failuresByPhase" | "sessionId", number>> = {};
+    const bounded = { ...snap, totals: this.totals(), truncated: { maxCharacters: MAX_JSON_CHARACTERS, omitted } };
+    for (const category of ["events", "inflight"] as const) {
+      omitted[category] = bounded[category].length;
+      bounded[category] = [];
+      text = JSON.stringify(bounded, null, 2);
+      if (text.length <= MAX_JSON_CHARACTERS) return text;
+    }
+    for (const category of ["tools", "roles", "controls", "tasks", "workflows", "byWorkspace", "failuresByPhase"] as const) {
+      omitted[category] = Object.keys(bounded[category]).length;
+      bounded[category] = {};
+      text = JSON.stringify(bounded, null, 2);
+      if (text.length <= MAX_JSON_CHARACTERS) return text;
+    }
+    // Session IDs originate outside this class and have no input length bound.
+    omitted.sessionId = bounded.sessionId === undefined ? 0 : 1;
+    delete bounded.sessionId;
+    return JSON.stringify(bounded, null, 2);
   }
 
   private guard(fn: () => void): void { try { fn(); } catch { /* Observability must not affect execution. */ } }

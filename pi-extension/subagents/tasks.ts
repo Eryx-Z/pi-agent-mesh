@@ -173,6 +173,7 @@ export class TaskManager {
     const record: TaskRecord = {
       version: plan ? 3 : 2, id, name: uniqueName(input.name ?? input.context, [...this.records.values()].map(r => r.name)),
       task: input.task, access: input.access, context: input.context,
+      ...(!plan && input.context === "partial" ? { recoveryContext: { version: 1 as const, contextText: input.contextText! } } : {}),
       loadout: plan ? initialRoleLoadout(plan, input.access) : applyAccess(input.loadout!, input.access),
       availableLoadout: plan ? undefined : structuredClone(input.loadout), workflow: input.workflow,
       ...(plan ? { rolePlan: plan, roleBaseline: [], taskInput: { task: input.task, context: input.context,
@@ -240,7 +241,12 @@ export class TaskManager {
     const prompt = neverSubmitted ?
       taskPrompt(record.taskInput!.task, selected, record.taskInput!.context, record.taskInput!.contextText) +
         (continuation !== undefined ? `\n\nContinuation task (takes precedence):\n${continuation}` : "") :
-      `${COOPERATION}\nAccess: ${record.access}\nContinuation task:\n${continuation}`;
+      `${COOPERATION}\nAccess: ${record.access}` +
+        // The header-only seed (and an RPC receipt) cannot prove the first prompt was
+        // persisted. Replay the saved selection on explicit AND automatic continuation,
+        // before the latest instruction so its established precedence is unchanged.
+        (record.recoveryContext ? `\nOriginal selected parent context (saved before submission):\n${record.recoveryContext.contextText}\n` : "") +
+        `\nContinuation task:\n${continuation}`;
     await this.start(record, prompt, release);
     return record;
   }

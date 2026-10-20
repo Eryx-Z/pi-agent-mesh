@@ -278,7 +278,8 @@ export async function installMainMcpRouter(pi: ExtensionAPI, team: ReturnType<ty
   let nativeCommand: Omit<RegisteredCommand, "name" | "sourceInfo"> | undefined;
   const enabled = () => {
     const disabled = pi.getSettings().extensions ?? [];
-    return (!process.argv.includes("--no-extensions") || process.argv.includes("builtin:mcp")) && !disabled.includes("-builtin:mcp") && !disabled.includes("-builtin:*");
+    const noExtensions = process.argv.includes("--no-extensions") || process.argv.includes("-ne");
+    return (!noExtensions || process.argv.includes("builtin:mcp")) && !disabled.includes("-builtin:mcp") && !disabled.includes("-builtin:*");
   };
   pi.registerCommand("mcp", { description: "MCP status (team configuration is frozen)", async handler(args, ctx) {
     const selected = team.state === "off" ? enabled() ? nativeCommand : undefined : team.command;

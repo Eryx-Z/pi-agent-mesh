@@ -74,6 +74,7 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
   const baseline = new Map<string, unknown>();
   const rawInventory = new Map<string, unknown[]>();
   const rawBaseline = new Map<string, unknown[]>();
+  const inventoryCleanups = new Map<string, () => void>();
   const credentials = new Set<string>();
   const redactDiagnostic = (value: string): string => {
     const literals = [...credentials].filter(Boolean).sort((a, b) => b.length - a.length).map(s => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"));
@@ -171,22 +172,54 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
     // Do not give the transport the native OAuth provider. Only explicitly supplied headers are used.
     const transport = "url" in config ? new StreamableHttpTransport({ url: config.url, headers: config.headers }) :
       new StdioTransport({ command: config.command, args: config.args, cwd: config.cwd, env: config.env, stderr: "pipe" });
+    // Native HTTP renewal detaches (but does not close) the old client. Its outstanding
+    // discovery must no longer retain tokens or publish an inventory into this connection.
+    inventoryCleanups.get(entry.name)?.();
     const state = { initialized: false, alive: true, refreshing: false, inventoryFailed: false };
     connections.set(entry.name, state); transports.add(transport);
-    const requests = new Map<string | number, string>();
-    let inventory: { name: string; inputSchema: Record<string, unknown>; outputSchema?: unknown }[] = [];
-    let inventoryComplete = false;
+    type RawTool = { name: string; inputSchema: Record<string, unknown>; outputSchema?: unknown };
+    type Inventory = { tools: RawTool[]; cursors: Map<string, string>; pages: number; token?: string };
+    const requests = new Map<string | number, { method: string; inventory?: Inventory }>();
+    const inventories = new Set<Inventory>();
+    const cursorTokens = new Map<string, { inventory: Inventory; cursor: string }>();
+    let nextToken = 0, inventoryComplete = false;
+    let cohortInventory: unknown[] | undefined;
+    const discardInventory = (inventory: Inventory, failed = false) => {
+      if (failed) state.inventoryFailed = true;
+      if (inventory.token !== undefined) cursorTokens.delete(inventory.token);
+      inventories.delete(inventory);
+      inventory.tools = []; inventory.cursors.clear();
+    };
+    const invalidateInventories = () => {
+      for (const inventory of inventories) discardInventory(inventory, true);
+      requests.clear(); cursorTokens.clear(); cohortInventory = undefined;
+    };
+    inventoryCleanups.set(entry.name, invalidateInventories);
+    const settleInventory = () => setImmediate(() => {
+      // Native listAll/registerTool continuations must finish before calls resume. A sibling
+      // refresh, including one waiting between pages, keeps the entire server fail-closed.
+      state.refreshing = state.inventoryFailed || inventories.size > 0 || !inventoryComplete;
+    });
     const pendingSends = new Set<string | number>(), cancelledSends = new Set<string | number>();
-    transport.onClose(() => { state.alive = false; });
-    transport.onError(() => { state.alive = false; });
-    // Observe protocol envelopes, never alter native tool call results, progress or cancellation.
+    transport.onClose(() => { state.alive = false; invalidateInventories(); });
+    transport.onError(() => { state.alive = false; invalidateInventories(); });
+    const originalClose = transport.close.bind(transport);
+    transport.close = async () => { state.alive = false; invalidateInventories(); await originalClose(); };
+    // Only tools/list pagination envelopes are translated below. Tool results, raw definitions,
+    // progress and cancellation stay native. Never mutate a shared request/response envelope.
     const originalSend = transport.send.bind(transport);
     transport.send = async message => {
       if (closed) throw new Error(`Role ${plan.roleId}: MCP adapter closed`);
       const callId = "method" in message && message.method === "tools/call" && "id" in message ? message.id : undefined;
       if ("method" in message && message.method === "notifications/cancelled") {
         const id = (message.params as { requestId?: string | number } | undefined)?.requestId;
-        if (id !== undefined && pendingSends.has(id)) cancelledSends.add(id);
+        if (id !== undefined) {
+          if (pendingSends.has(id)) cancelledSends.add(id);
+          const request = requests.get(id);
+          if (request?.inventory) {
+            discardInventory(request.inventory, true); requests.delete(id); settleInventory();
+          }
+        }
       }
       if (callId !== undefined) pendingSends.add(callId);
       try {
@@ -201,13 +234,42 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
           if (!ready || connections.get(entry.name) !== state) throw new Error(`Role ${plan.roleId} MCP ${entry.name}: tool call before verified connection`);
           verify();
         }
+        let outgoing = message;
         if ("method" in message && "id" in message) {
-          requests.set(message.id, message.method);
-          if (message.method === "tools/list" && !(message.params as { cursor?: unknown } | undefined)?.cursor) {
-            inventory = []; inventoryComplete = false; state.refreshing = true; state.inventoryFailed = false;
+          let inventory: Inventory | undefined;
+          if (message.method === "tools/list") {
+            if (closed || !state.alive || connections.get(entry.name) !== state) throw new Error("MCP inventory connection unavailable");
+            const params = message.params as { cursor?: unknown } | undefined;
+            if (params && Object.hasOwn(params, "cursor")) {
+              const continuation = typeof params.cursor === "string" ? cursorTokens.get(params.cursor) : undefined;
+              if (!continuation || !inventories.has(continuation.inventory)) {
+                state.inventoryFailed = true; invalidateInventories();
+                throw new Error("MCP inventory pagination token unavailable");
+              }
+              inventory = continuation.inventory;
+              cursorTokens.delete(inventory.token!); inventory.token = undefined;
+              outgoing = { ...message, params: { ...params, cursor: continuation.cursor } };
+            } else {
+              if (!inventories.size) {
+                state.inventoryFailed = false; inventoryComplete = false; cohortInventory = undefined;
+              }
+              inventory = { tools: [], cursors: new Map(), pages: 0 };
+              inventories.add(inventory);
+            }
+            state.refreshing = true;
           }
+          requests.set(message.id, { method: message.method, inventory });
         }
-        return await originalSend(message);
+        return await originalSend(outgoing);
+      } catch (error) {
+        if ("id" in message) {
+          const request = requests.get(message.id);
+          if (request?.inventory) {
+            discardInventory(request.inventory, true); settleInventory();
+          }
+          requests.delete(message.id);
+        }
+        throw error;
       } finally {
         if (callId !== undefined) { pendingSends.delete(callId); cancelledSends.delete(callId); }
       }
@@ -215,36 +277,61 @@ export async function setupRoleMcp(pi: ExtensionAPI, plan: RolePlan, access: Acc
     const originalOnMessage = transport.onMessage.bind(transport);
     transport.onMessage = listener => originalOnMessage(message => {
       if ("method" in message && message.method === "notifications/message") return; // no credential-bearing server logs
-      if ("method" in message && message.method === "notifications/tools/list_changed") state.refreshing = true;
-      if ("id" in message && !("method" in message)) {
-        const method = requests.get(message.id);
+      const current = !closed && state.alive && connections.get(entry.name) === state;
+      if (current && "method" in message && message.method === "notifications/tools/list_changed") state.refreshing = true;
+      let incoming = message;
+      if (current && "id" in message && !("method" in message)) {
+        const request = requests.get(message.id);
         requests.delete(message.id);
-        if (method === "initialize" && "result" in message) state.initialized = true;
-        if (method === "tools/list") {
+        if (request?.method === "initialize" && "result" in message) state.initialized = true;
+        const inventory = request?.inventory;
+        if (inventory && inventories.has(inventory)) {
           if ("result" in message) {
-            const page = message.result as { tools?: typeof inventory; nextCursor?: unknown } | null;
+            const page = message.result as { tools?: RawTool[]; nextCursor?: unknown } | null;
             const object = (v: unknown): v is Record<string, unknown> => !!v && typeof v === "object" && !Array.isArray(v);
             const cursor = page?.nextCursor;
             const ended = cursor === undefined || cursor === null || cursor === "";
-            // Match native validateListPage, including unselected entries. Native
-            // rejection of any page must never restore an older authorization.
+            // Match native validateListPage, including unselected entries. A rejected page
+            // must not restore an older authorization, even if another refresh succeeds.
             if (!object(page) || !Array.isArray(page.tools) ||
                 page.tools.some(t => !object(t) || typeof t.name !== "string" || !object(t.inputSchema)) ||
-                !ended && typeof cursor !== "string") state.inventoryFailed = true;
-            if (!state.inventoryFailed) {
-              inventory.push(...page!.tools!.filter(t => required.get(entry.name)!.has(t.name)));
+                !ended && typeof cursor !== "string") discardInventory(inventory, true);
+            else {
+              inventory.pages++;
+              inventory.tools.push(...page.tools.filter(t => required.get(entry.name)!.has(t.name)));
               if (ended) {
+                const snapshot = copy(inventory.tools.sort((a, b) => a.name.localeCompare(b.name)));
+                // Every completed refresh must agree, not just the last one to respond.
+                // Once ready, real selected drift permanently invalidates this adapter:
+                // an older unchanged response must never re-authorize changed definitions.
+                if (ready && !isDeepStrictEqual(rawBaseline.get(entry.name), snapshot)) {
+                  failure = `Role ${plan.roleId} MCP ${entry.name}: selected tool schema/configuration changed`;
+                  state.inventoryFailed = true;
+                } else if (cohortInventory && !isDeepStrictEqual(cohortInventory, snapshot)) state.inventoryFailed = true;
+                cohortInventory = snapshot;
                 inventoryComplete = true;
-                rawInventory.set(entry.name, copy(inventory.sort((a, b) => a.name.localeCompare(b.name))));
+                rawInventory.set(entry.name, snapshot);
+                discardInventory(inventory);
+              } else {
+                const remoteCursor = cursor as string;
+                const repeated = inventory.cursors.get(remoteCursor);
+                // Native has no refresh ID and concurrent lists may share remote cursors.
+                // Give listAll a unique, single-use local cursor, restoring the exact remote
+                // string on send. Preserve native repeated-cursor and 1,000-page failures.
+                const token = repeated ?? `role-mcp-page:${++nextToken}`;
+                incoming = { ...message, result: { ...page, nextCursor: token } };
+                if (repeated !== undefined || inventory.pages >= 1000) discardInventory(inventory, true);
+                else {
+                  inventory.cursors.set(remoteCursor, token); inventory.token = token;
+                  cursorTokens.set(token, { inventory, cursor: remoteCursor });
+                }
               }
             }
-          } else state.inventoryFailed = true;
-          // Native processes the response and synchronously registers the complete list (incl. hidden
-          // withdrawals). Keep calls fail-closed while paginated discovery is still in flight.
-          setImmediate(() => { if (![...requests.values()].includes("tools/list")) state.refreshing = state.inventoryFailed || !inventoryComplete; });
+          } else discardInventory(inventory, true);
+          settleInventory();
         }
       }
-      listener(message);
+      listener(incoming);
     });
     return transport;
   };

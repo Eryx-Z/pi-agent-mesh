@@ -302,7 +302,7 @@ All executable local code and selected servers must be trusted. Hashes freeze th
 - role creations, continuations, recoveries, standalone versus workflow, access/context/model, preflight and terminal outcomes, questions and answers
 - task launches and outcomes, workflow scheduling transitions, PM readiness, catalog load/reload and parent turn stop reasons
 
-Tool arguments, tool results and prompts are omitted. Error text is truncated and redacted; do not treat the file as a secret store or a transcript. A blocked call is not counted as success. Calls still in flight when the process reloads are marked aborted, not successful. `/mesh tools`, `/mesh roles`, `/mesh events 50` and `/mesh json` select a section. This is a read-only snapshot, not a control, and it is intentionally not a management tool so saved PM snapshots remain compatible.
+Tool arguments, tool results and prompts are omitted. Error text is truncated and redacted; do not treat the file as a secret store or a transcript. A blocked call is not counted as success. Calls still in flight when the process reloads are marked aborted, not successful. `/mesh tools`, `/mesh roles`, `/mesh events 50` and `/mesh json` select a section. This is a read-only snapshot, not a control, and it is intentionally not a management tool so saved PM snapshots remain compatible. `/mesh json` always returns valid JSON within 64,000 characters. Oversized exports omit events, in-flight detail and then whole counter categories as needed; `truncated.omitted` counts entries omitted from the requested snapshot and `totals` retains full-session totals, not just the retained detail. Privacy metadata is preserved. These export limits do not trim the persisted snapshot.
 
 ## Development and isolated trial
 

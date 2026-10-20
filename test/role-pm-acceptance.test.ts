@@ -1,4 +1,5 @@
 import { test, type TestContext } from "node:test";
+import { createServer, type ServerResponse } from "node:http";
 import assert from "node:assert/strict";
 import { chmodSync, existsSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -26,8 +27,8 @@ function fixture(t: TestContext) {
   const env: NodeJS.ProcessEnv = { ...process.env, PI_CODING_AGENT_DIR: join(dir, "agent"), PI_AGENT_MESH_CONFIG: "", PI_OFFLINE: "1", PI_SKIP_VERSION_CHECK: "1", PI_TELEMETRY: "0", ROLE_TEAM_LOG: log };
   for (const key of Object.keys(env)) if (key.startsWith("PI_RPC_SUBAGENT_") || key.startsWith("PI_SUBAGENT_")) delete env[key];
   const events: any[] = [], processes: RpcProcess[] = [];
-  const open = (before: string[] = [], after: string[] = []) => {
-    const rpc = new RpcProcess({ command: process.execPath, cwd: dir, env, args: [cli, "--mode", "rpc", "--session", session, "--no-extensions", "--no-skills", "--no-context-files", "--no-prompt-templates", "--approve", "--model", "role-team-fixture/pm", "--thinking", "off", ...[provider, inspector, ...before, mesh, ...after].flatMap(e => ["-e", e])] });
+  const open = (before: string[] = [], after: string[] = [], extensionFlag = "--no-extensions") => {
+    const rpc = new RpcProcess({ command: process.execPath, cwd: dir, env, args: [cli, "--mode", "rpc", "--session", session, extensionFlag, "--no-skills", "--no-context-files", "--no-prompt-templates", "--approve", "--model", "role-team-fixture/pm", "--thinking", "off", ...[provider, inspector, ...before, mesh, ...after].flatMap(e => ["-e", e])] });
     rpc.on("event", event => events.push(event)); processes.push(rpc); return rpc;
   };
   t.after(async () => {
@@ -152,6 +153,51 @@ test("an unwritable failure-record directory reports non-durability without repl
   assert.ok(f.events.some(e => e.method === "setStatus" && e.statusText === "PM failed"));
   await rpc.request("prompt", { message: "still blocked" }); assert.deepEqual(f.requests(), []);
   assert.equal(existsSync(f.session), false); assert.deepEqual(f.failurePaths(), []);
+  assert.equal(f.events.some(e => e.type === "extension_error"), false, JSON.stringify(f.events));
+});
+
+for (const flag of ["--no-extensions", "-ne"]) test(`non-role ${flag} suppresses the router's native MCP lifecycle`, { timeout: 20000 }, async t => {
+  const f = fixture(t), marker = join(f.dir, "ambient-connected"); rmSync(f.config);
+  writeFileSync(join(f.dir, ".pi/mcp.json"), JSON.stringify({ mcpServers: { ambient: { command: process.execPath, args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)},'connected')`] } } }));
+  const rpc = f.open([], [], flag);
+  await rpc.request("prompt", { message: "ordinary conversation without native MCP" });
+  await until(() => f.events.some(e => e.type === "agent_settled"));
+  await rpc.stop();
+  assert.equal(existsSync(marker), false, "Disabled native MCP must not execute configured servers");
+  assert.equal(f.requests().length, 1);
+});
+
+test("handled input does not strand a later worker result at an otherwise idle PM", {
+  timeout: 25000,
+  todo: "Pi 1.0.2 exposes no prompt-preflight completion/idle contract for handled or rejected input; do not approximate with timers",
+}, async t => {
+  const f = fixture(t);
+  // Keep a real worker's bash call pending until AFTER the host confirms handled.
+  // This barrier does not rely on timing, provider credentials, or external network.
+  let accept!: (response: ServerResponse) => void;
+  const arrived = new Promise<ServerResponse>(resolve => { accept = resolve; });
+  const server = createServer((_request, response) => accept(response));
+  await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
+  t.after(() => { server.closeAllConnections(); server.close(); });
+  const address = server.address() as { port: number };
+  const blocker = join(f.dir, "handle-input.mjs");
+  writeFileSync(blocker, "export default pi => pi.on('input', event => event.text === 'CONSUME_WITHOUT_RUN' ? {action:'handled'} : undefined);");
+  writeFileSync(f.config, f.validConfig.replace("roles: {pm: ./pm.yaml}", "roles: {pm: ./pm.yaml, builder: 'builtin:builder'}"));
+  const rpc = f.open([], [blocker]);
+  const command = `${JSON.stringify(process.execPath)} -e ${JSON.stringify(`fetch('http://127.0.0.1:${address.port}').then(r=>r.text()).then(console.log)`)}`;
+  await rpc.request("prompt", { message: `CALL ${JSON.stringify({ name: "subagent", arguments: { role: "builder", task: `CALL ${JSON.stringify({ name: "bash", arguments: { command } })}`, contextText: "Wait for the deterministic acceptance barrier" } })}` });
+  const response = await arrived;
+  await until(() => f.events.some(e => e.type === "agent_settled"));
+  const settled = f.events.filter(e => e.type === "agent_settled").length;
+  assert.deepEqual(await rpc.request("prompt", { message: "CONSUME_WITHOUT_RUN" }), { disposition: "handled" });
+  assert.equal((await rpc.request("get_state")).isStreaming, false);
+  assert.equal(f.events.filter(e => e.type === "agent_settled").length, settled, "Handled input starts no agent and emits no settled event");
+  response.end("HANDLED_INPUT_WORKER_RESULT");
+  await until(() => f.requests().some(request => request.child && JSON.stringify(request.messages).includes("HANDLED_INPUT_WORKER_RESULT")));
+  t.diagnostic(JSON.stringify({ handledReceipt: true, workerToolResultObserved: true, parentProviderCalls: f.requests().filter(request => !request.child).length, hostState: await rpc.request("get_state") }));
+  await until(() => f.requests().some(request => !request.child && JSON.stringify(request.messages).includes("rpc_subagent_result")));
+  await until(async () => !(await rpc.request("get_state")).isStreaming);
+  assert.equal(f.requests().filter(request => !request.child).length, 3, "Only dispatch, tool follow-up and one notification wakeup may run");
   assert.equal(f.events.some(e => e.type === "extension_error"), false, JSON.stringify(f.events));
 });
 
