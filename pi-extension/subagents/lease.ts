@@ -5,8 +5,10 @@ export interface ExecutionLease { readonly alive: boolean; release(): Promise<vo
 /** Kernel flock survives neither holder exit nor host death; no stale-file unlink race. */
 export function acquireExecutionLease(path: string, onLost?: () => void): Promise<ExecutionLease> {
   return new Promise((resolve, reject) => {
-    const child = spawn("flock", ["--exclusive", "--nonblock", "--close", path, process.execPath, "-e",
-      'process.stdout.write("locked\\n"); process.stdin.resume(); process.stdin.on("end", () => process.exit(0));'],
+    // process.execPath may be a compiled Pi binary, not a JavaScript runtime.
+    // A POSIX shell holds stdin open until EOF without starting another Pi.
+    const child = spawn("flock", ["--exclusive", "--nonblock", "--close", path, "/bin/sh", "-c",
+      'printf "locked\\n"; while IFS= read -r line; do :; done'],
     { stdio: "pipe", detached: true });
     let ready = false, closed = false, output = "", stderr = "";
     let release: Promise<void> | undefined;

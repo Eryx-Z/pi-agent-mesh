@@ -2,7 +2,7 @@ import { getPackageDir, type ExtensionAPI, type ExtensionContext, type Skill } f
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { join, resolve } from "node:path";
-import { readFileSync } from "node:fs";
+import { piInvocation } from "./runtime.ts";
 import { nonempty, resolveLoadout } from "./loadout.ts";
 import { snapshotContext } from "./context.ts";
 import { TaskStore, bounded, toolHistory } from "./store.ts";
@@ -64,13 +64,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const display = new TaskWidget();
     ctxForWidget = ctx;
     // Host imports are mapped by Pi's loader; native module resolution cannot locate them.
-    const packageDir = getPackageDir();
-    const manifest = JSON.parse(readFileSync(join(packageDir, "package.json"), "utf8"));
-    const cli = join(packageDir, manifest.bin.pi);
+    const invocation = piInvocation(getPackageDir());
     const dir = join(ctx.sessionManager.getSessionDir(), "rpc-subagents", ctx.sessionManager.getSessionId());
     manager = await TaskManager.open(new TaskStore(dir), {
       maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
-      command: process.execPath, baseArgs: [cli],
+      ...invocation,
       notify(record, kind) {
         if (kind === "result") display.result(record);
         const content = kind === "question"
