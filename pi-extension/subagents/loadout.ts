@@ -7,6 +7,8 @@ import { isDeepStrictEqual } from "node:util";
 
 export const CHILD_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "child.ts");
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
+// Reload Pi's bundled extension explicitly in children using --no-extensions.
+const BUILTIN_EXTENSION_TOOLS = new Map([["codemode", "builtin:codemode"]]);
 const DELEGATION_TOOLS = new Set(["subagent", "subagent_message", "subagents_list", "subagent_control", "delegate", "delegate_task", "workflow_run", "workflow_control"]);
 export type AccessMode = "read-only" | "full";
 export function accessMode(value: unknown): AccessMode {
@@ -60,9 +62,11 @@ function file(path: string, label: string): string {
   throw new Error(`Cannot inherit ${label}: missing source file ${path}`);
 }
 export function snapshotTool(tool: ToolInfo): ToolSnapshot {
-  const source = tool.sourceInfo?.source === "builtin" ? "builtin" : "extension";
+  const builtinExtension = tool.sourceInfo?.source === "builtin" ? BUILTIN_EXTENSION_TOOLS.get(tool.name) : undefined;
+  if (builtinExtension && tool.sourceInfo.path !== builtinExtension) throw new Error(`Invalid builtin provenance: ${tool.name}`);
+  const source = tool.sourceInfo?.source === "builtin" && !builtinExtension ? "builtin" : "extension";
   if (tool.sourceInfo?.source === "sdk") throw new Error(`Cannot inherit tool ${tool.name}: SDK tools have no reloadable implementation`);
-  const path = source === "builtin" ? `<builtin:${tool.name}>` : file(tool.sourceInfo?.path, `tool ${tool.name}`);
+  const path = builtinExtension ?? (source === "builtin" ? `<builtin:${tool.name}>` : file(tool.sourceInfo?.path, `tool ${tool.name}`));
   // Pi 1.0 uses builtin:<name>; older hosts used <builtin:<name>>.
   // Keep persisted snapshots canonical and reject mismatched names or sources.
   if (source === "builtin" && (!BUILTIN_TOOLS.has(tool.name) ||
@@ -122,7 +126,9 @@ export function validateLoadout(value: unknown, options: { resources?: boolean }
           Object.values(t.annotations).some(v => typeof v !== "boolean")))) throw new Error(`Invalid tool metadata: ${t.name}`);
     if (t.source === "builtin") {
       if (!BUILTIN_TOOLS.has(t.name) || t.path !== `<builtin:${t.name}>`) throw new Error(`Invalid builtin provenance: ${t.name}`);
-    } else if (t.source !== "extension" || sourcePath(t.path, `tool ${t.name}`) !== t.path) throw new Error(`Invalid tool provenance: ${t.name}`);
+    } else if (t.source !== "extension" ||
+        ((typeof t.path !== "string" || BUILTIN_EXTENSION_TOOLS.get(t.name) !== t.path) &&
+          sourcePath(t.path, `tool ${t.name}`) !== t.path)) throw new Error(`Invalid tool provenance: ${t.name}`);
   }
   const extensions = [...new Set(l.toolMetadata.filter(t => t.source === "extension").map(t => t.path))];
   if (!isDeepStrictEqual(l.extensions, extensions)) throw new Error("Extension sources do not match inherited tools");

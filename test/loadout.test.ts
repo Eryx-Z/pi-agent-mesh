@@ -127,6 +127,34 @@ test("builtin provenance accepts Pi 1.0 paths and normalizes legacy snapshots wi
     assert.throws(() => resolveLoadout({ getActiveTools: () => ["unknown"], getAllTools: () => [{ ...modern, name: "unknown", sourceInfo: { ...modern.sourceInfo, path: "builtin:unknown" } }] }, [], t.dir, "fake/test", "off", t.dir), /Invalid builtin provenance/);
   } finally { t.clean(); }
 });
+test("codemode builtin is inherited by full children but excluded from read-only children", () => {
+  const t = setup();
+  try {
+    const codemode = { ...readInfo(t.dir), name: "codemode", description: "Execute JavaScript tools", sourceInfo: { ...readInfo(t.dir).sourceInfo, path: "builtin:codemode" } };
+    const api = (tool = codemode) => ({ getActiveTools: () => ["read", "codemode"], getAllTools: () => [readInfo(t.dir), tool] });
+    const l = resolveLoadout(api(), [], t.dir, "fake/test", "off", t.dir);
+    assert.deepEqual(applyAccess(l, "full").tools, ["read", "codemode", "ask_question"]);
+    assert.equal(l.toolMetadata.find(tool => tool.name === "codemode")?.path, "builtin:codemode");
+    assert.equal(l.toolMetadata.find(tool => tool.name === "codemode")?.source, "extension");
+    assert.deepEqual(l.extensions, ["builtin:codemode"]);
+    verifyTools(l, [...api().getAllTools(), t.question]);
+    const ro = applyAccess(l, "read-only");
+    assert.deepEqual(ro.tools, ["read", "ask_question"]);
+    assert.ok(!ro.toolMetadata.some(tool => tool.name === "codemode"));
+    assert.deepEqual(ro.extensions, []);
+    for (const path of ["builtin:read", "<builtin:read>", "<builtin:codemode>", t.source, ""]) {
+      assert.throws(() => resolveLoadout(api({ ...codemode, sourceInfo: { ...codemode.sourceInfo, path } }), [], t.dir, "fake/test", "off", t.dir), /Invalid builtin provenance/);
+    }
+    assert.throws(() => verifyTools(l, [readInfo(t.dir), t.question]), /missing required tool/);
+    for (const resources of [true, false]) {
+      const forged = structuredClone(l);
+      forged.toolMetadata[1].path = "builtin:unknown";
+      forged.extensions = ["builtin:unknown"];
+      assert.throws(() => validateLoadout(forged, { resources }), /absolute/);
+    }
+  } finally { t.clean(); }
+});
+
 test("tool inheritance freezes exposure, namespace and annotations and rejects semantic drift", () => {
   const t = setup();
   try {

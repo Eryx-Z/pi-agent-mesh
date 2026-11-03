@@ -20,6 +20,8 @@ export default function builtinProvider(pi: ExtensionAPI) {
       const input = last?.role === "user" ? (typeof last.content === "string" ? last.content : last.content.filter(b => b.type === "text").map(b => b.text).join("\n")) : "";
       const content: AssistantMessage["content"] = input.startsWith("DISPATCH ")
         ? [{ type: "toolCall", id: "dispatch", name: "subagent", arguments: JSON.parse(input.slice(9)) }]
+        : process.env.PI_RPC_SUBAGENT_CHILD === "1" && input.includes("Assigned task:\nCODEMODE_BUILTIN")
+          ? [{ type: "toolCall", id: "codemode-input", name: "codemode", arguments: { code: 'text("codemode child executed")' } }]
         : process.env.PI_RPC_SUBAGENT_CHILD === "1" && input.includes("Assigned task:\nREAD_BUILTIN")
           ? [{ type: "toolCall", id: "read-input", name: "read", arguments: { path: "fixture-input.txt" } }]
           : process.env.PI_RPC_SUBAGENT_CHILD === "1" && input.includes("Assigned task:\nNESTED_ASK")
