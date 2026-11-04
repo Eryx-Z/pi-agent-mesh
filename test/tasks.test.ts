@@ -201,6 +201,33 @@ test('toolUse requires successful termination evidence for every call in the fin
   }
 });
 
+test('transport failure keeps a thinking preview and stays failed without an execution boundary', async () => {
+  const { EventEmitter } = await import('node:events');
+  const t = setup();
+  const events: string[] = [];
+  const rpc = new EventEmitter() as any;
+  rpc.request = async (type: string, fields: any) => {
+    if (type === 'get_commands') return { commands: [{ name: 'rpc-subagent-preflight' }] };
+    if (type === 'get_state') return { isStreaming: false, isCompacting: false, pendingMessageCount: 0 };
+    if (type === 'prompt' && fields.message !== '/rpc-subagent-preflight') rpc.emit('event', { type: 'agent_start' });
+  };
+  rpc.stop = async () => {};
+  const manager = new TaskManager(new TaskStore(t.dir), {
+    command: 'unused', createRpc: () => rpc, notify: (r, kind) => events.push(`${kind}:${r.state}:${r.error}`),
+  });
+  try {
+    const record = await manager.launch({ task: 'review', access: 'full', context: 'none', loadout: t.loadout });
+    rpc.emit('event', { type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'terminated', content: [{ type: 'thinking', thinking: 'still reading index.ts' }] } });
+    rpc.emit('event', { type: 'agent_settled' });
+    await until(() => record.stopped);
+    assert.equal(record.state, 'failed');
+    assert.equal(record.error, 'terminated');
+    assert.match(record.output, /still reading index.ts/);
+    assert.equal(record.execution, undefined);
+    assert.deepEqual(events, ['result:failed:terminated']);
+  } finally { await manager.shutdown(); await t.clean(); }
+});
+
 test('accepted unstarted reconciliation preserves queued work and rechecks lifecycle races', async () => {
   const { EventEmitter } = await import('node:events');
   for (const race of [false, true]) {

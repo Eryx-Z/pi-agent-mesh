@@ -7,8 +7,8 @@ import { isDeepStrictEqual } from "node:util";
 
 export const CHILD_EXTENSION = join(dirname(fileURLToPath(import.meta.url)), "child.ts");
 const BUILTIN_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls", "powershell"]);
-// Reload Pi's bundled extension explicitly in children using --no-extensions.
-const BUILTIN_EXTENSION_TOOLS = new Map([["codemode", "builtin:codemode"]]);
+// Pi ships these tools as reloadable builtin extensions, not core tool definitions.
+const BUILTIN_EXTENSION_TOOLS = new Map([["codemode", "builtin:codemode"], ["tool_search", "builtin:tool-search"]]);
 const DELEGATION_TOOLS = new Set(["subagent", "subagent_message", "subagents_list", "subagent_control", "delegate", "delegate_task", "workflow_run", "workflow_control"]);
 export type AccessMode = "read-only" | "full";
 export function accessMode(value: unknown): AccessMode {

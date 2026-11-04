@@ -155,6 +155,31 @@ test("codemode builtin is inherited by full children but excluded from read-only
   } finally { t.clean(); }
 });
 
+test("Pi builtin extensions inherit reloadable sources and stay excluded from read-only children", () => {
+  const t = setup();
+  try {
+    for (const [name, path] of [["codemode", "builtin:codemode"], ["tool_search", "builtin:tool-search"]]) {
+      const tool = { ...readInfo(t.dir), name, sourceInfo: { ...readInfo(t.dir).sourceInfo, path } };
+      const api = { getActiveTools: () => ["read", name], getAllTools: () => [readInfo(t.dir), tool] };
+      const l = resolveLoadout(api, [], t.dir, "fake/test", "off", t.dir);
+      assert.deepEqual(l.extensions, [path]);
+      assert.equal(l.toolMetadata[1].source, "extension");
+      assert.equal(l.toolMetadata[1].path, path);
+      assert.deepEqual(applyAccess(l, "full"), l);
+      verifyTools(l, [...api.getAllTools(), t.question]);
+      const ro = applyAccess(l, "read-only");
+      assert.deepEqual(ro.tools, ["read", "ask_question"]);
+      assert.deepEqual(ro.extensions, []);
+      for (const wrongPath of ["builtin:unknown", "builtin:read", t.source]) {
+        assert.throws(() => resolveLoadout({ ...api, getAllTools: () => [readInfo(t.dir), { ...tool, sourceInfo: { ...tool.sourceInfo, path: wrongPath } }] }, [], t.dir, "fake/test", "off", t.dir), /Invalid builtin provenance/);
+      }
+      const forged = structuredClone(l);
+      forged.toolMetadata[1].path = "builtin:unknown";
+      forged.extensions = ["builtin:unknown"];
+      assert.throws(() => validateLoadout(forged), /absolute/);
+    }
+  } finally { t.clean(); }
+});
 test("tool inheritance freezes exposure, namespace and annotations and rejects semantic drift", () => {
   const t = setup();
   try {

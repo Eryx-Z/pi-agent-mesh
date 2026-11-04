@@ -3,6 +3,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { join, resolve } from "node:path";
 import { piInvocation } from "./runtime.ts";
+import { isTransportFailure } from "./diagnostics.ts";
 import { nonempty, resolveLoadout } from "./loadout.ts";
 import { snapshotContext } from "./context.ts";
 import { TaskStore, bounded, toolHistory } from "./store.ts";
@@ -67,14 +68,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     const invocation = piInvocation(getPackageDir());
     const dir = join(ctx.sessionManager.getSessionDir(), "rpc-subagents", ctx.sessionManager.getSessionId());
     manager = await TaskManager.open(new TaskStore(dir), {
-      maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 8),
+      maxConcurrent: Number(process.env.PI_SUBAGENT_MAX_CONCURRENT ?? 16),
       ...invocation,
       notify(record, kind) {
         if (kind === "result") display.result(record);
         const content = kind === "question"
           ? `Subagent ${record.name} (${record.id}) needs an answer:\n${record.questions.filter(q => !q.responseSent).map(q => `${q.id}: ${q.title}`).join("\n")}\nUse subagent_control action=answer with id, questionId, message.`
           : `Subagent ${record.name} (${record.id}) ${record.state}.\n${record.error ?? ""}\n${record.recovery?.error ?? ""}\n${bounded(record.output)}\nSession: ${record.sessionFile}\nStopping is not acceptance: review its validation and shared-workspace changes.`;
-        pi.sendMessage({ customType: `rpc_subagent_${kind}`, content, display: true, details: { id: record.id, state: record.state } }, { deliverAs: "steer", triggerTurn: true });
+        const summary = [record.error, record.recovery?.error, record.output].filter(Boolean).join("\n");
+        const details = {
+          id: record.id, name: record.name, state: record.state, run: record.run,
+          ...(kind === "question"
+            ? { questionIds: record.questions.filter(q => !q.responseSent).map(q => q.id) }
+            : { summary: summary.length > 1200 ? `${summary.slice(0, 1199)}…` : summary }),
+        };
+        const transportFailure = kind === "result" && record.state === "failed" && isTransportFailure(record.error);
+        pi.sendMessage({ customType: `rpc_subagent_${kind}`, content, display: true, details }, { deliverAs: "steer", triggerTurn: !transportFailure });
       },
     });
     workflows = new WorkflowManager(manager, join(dir, "workflows"), r => {
@@ -100,7 +109,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.on("tool_execution_end", event => { snapshots.delete(event.toolCallId); });
   pi.registerTool({
     name: "subagent", label: "Subagent",
-    description: "Launch an asynchronous RPC subagent in the shared working directory. Required access: read-only (verified builtin read/grep/find/ls only, plus ask_question) or full (parent active nondelegation tools). Tool filtering is not a sandbox. Context: none, partial (default; requires contextText), full (frozen active branch). Results/questions arrive automatically. Use subagent_control for history, questions, follow-up and continuation.",
+    description: "Launch an asynchronous RPC subagent in the shared working directory. Required access: read-only (only parent-active builtin read/grep/find/ls, plus ask_question; inactive search tools are not granted) or full (parent active nondelegation tools). Tool filtering is not a sandbox. Context: none, partial (default; requires contextText), full (frozen active branch). Results/questions arrive automatically. Use subagent_control for history, questions, follow-up and continuation.",
     promptSnippet: "Delegate a task with explicit access and context",
     promptGuidelines: [
       "Coordinate parallel writers; standalone subagents share the working directory and have no write locks.",
@@ -191,5 +200,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       } catch (e) { ctx.ui.notify(String(e), "error"); }
     },
   });
-  for (const type of ["rpc_subagent_result", "rpc_subagent_question", "rpc_workflow_result"]) pi.registerMessageRenderer(type, resultRenderer);
+  for (const type of ["rpc_subagent_result", "rpc_subagent_question"]) {
+    pi.registerMessageRenderer(type, (message, options, theme) => {
+      // Components outlive renderer calls. Never resolve a historical notice against
+      // another parent session; the renderer separately checks the task run.
+      const sessionFile = ctxForWidget?.sessionManager.getSessionFile();
+      return resultRenderer(message, options, theme, id => {
+        if (!sessionFile || ctxForWidget?.sessionManager.getSessionFile() !== sessionFile) return undefined;
+        return manager?.records.get(id);
+      });
+    });
+  }
+  pi.registerMessageRenderer("rpc_workflow_result", resultRenderer);
 }

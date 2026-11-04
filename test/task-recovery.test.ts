@@ -94,6 +94,27 @@ test('automatic cleanup retries failure, preserves terminal result and only then
   } finally { release(); await t.clean(); }
 });
 
+test('transport model failure resumes once; ordinary provider errors do not', linux, async () => {
+  const t = await setup();
+  try {
+    const manager = await t.open(10);
+    const transport = await manager.launch({ task: 'SCENARIO_TRANSPORT', access: 'full', context: 'none', loadout: loadout(t.dir) });
+    await until(() => transport.stopped && transport.run === 2 && transport.state === 'completed');
+    assert.equal(t.starts, 2);
+    assert.equal(transport.recoveryRuns, 1);
+    const recovery = t.prompts.find(p => p.includes('retained session history'));
+    assert.match(recovery ?? '', /SCENARIO_TRANSPORT/);
+    assert.match(recovery ?? '', /Do not blindly repeat side effects/);
+    const ordinary = await manager.launch({ task: 'SCENARIO_ERROR', access: 'full', context: 'none', loadout: loadout(t.dir) });
+    await until(() => ordinary.stopped);
+    await sleep(50);
+    assert.equal(ordinary.state, 'failed');
+    assert.equal(ordinary.run, 1);
+    assert.equal(ordinary.execution?.intent, 'failed');
+    assert.equal(t.starts, 3);
+  } finally { await t.clean(); }
+});
+
 test('interrupted task resumes exactly once with retained history and durable attempt reservation', linux, async () => {
   const t = await setup();
   try {

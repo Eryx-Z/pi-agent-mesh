@@ -50,7 +50,12 @@ function handle(e) {
     } else if (scenario.includes('SCENARIO_DIE')) setTimeout(() => process.exit(4), 15);
     else if (scenario.includes('SCENARIO_HOLD')) return;
     else if (scenario.includes('SCENARIO_ERROR')) setTimeout(() => complete('error'), 30);
-    else setTimeout(() => complete(), 30);
+    else if (scenario.includes('Assigned task:\nSCENARIO_TRANSPORT')) {
+      busy = false;
+      send({ type: 'message_end', message: { role: 'assistant', stopReason: 'error', errorMessage: 'terminated', content: [{ type: 'thinking', thinking: 'partial review' }] } });
+      send({ type: 'agent_end', messages: [] });
+      setTimeout(() => send({ type: 'agent_settled' }), 10);
+    } else setTimeout(() => complete(), 30);
     return;
   }
   if (e.type === 'echo') return setTimeout(() => response(e, { value: e.value }), e.delay ?? 0);

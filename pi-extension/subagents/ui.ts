@@ -1,6 +1,6 @@
 import { readFileSync, statSync } from "node:fs";
 import type { ExtensionContext, Theme } from "@earendil-works/pi-coding-agent";
-import { Text, stripTerminalSequences, truncateToWidth } from "@earendil-works/pi-tui";
+import { Text, stripTerminalSequences, truncateToWidth, wrapTextWithAnsi } from "@earendil-works/pi-tui";
 import type { TaskManager } from "./tasks.ts";
 import type { TaskRecord } from "./store.ts";
 import { taskDashboard, type DashboardPane, type TaskAction } from "./dashboard.ts";
@@ -232,23 +232,87 @@ async function taskAction(manager: TaskManager, ctx: ExtensionContext, id: strin
     if (answer?.trim()) manager.answer(record.id, id, answer);
   } else if (action === "Cancel" && await ctx.ui.confirm("Cancel task?", inline(record.name))) await manager.cancel(record.id);
 }
-export function resultRenderer(message: { content: unknown }, options: { expanded: boolean; outputPad?: number }, theme?: Theme): Text {
-  const [heading = "", ...body] = clean(String(message.content)).split("\n");
+type NoticeMessage = { content: unknown; customType?: string; details?: unknown };
+function noticeSnapshot(message: NoticeMessage, heading: string, body: string[]) {
+  const details = message.details && typeof message.details === "object" ? message.details as Record<string, unknown> : {};
+  // Old session entries only saved id/state. Parse their original notification too.
+  const legacy = /^Subagent (.+) \(([^)]+)\) (needs an answer:|completed\.|failed\.|cancelled\.)$/.exec(heading);
+  const question = message.customType === "rpc_subagent_question" || legacy?.[3] === "needs an answer:";
+  if (!legacy && !["rpc_subagent_question", "rpc_subagent_result"].includes(message.customType ?? "")) return undefined;
+  const questionIds = Array.isArray(details.questionIds) ? details.questionIds.filter((id): id is string => typeof id === "string")
+    : body.flatMap(line => /^([A-Za-z0-9-]+): /.exec(line)?.[1] ?? []);
+  const state = typeof details.state === "string" ? details.state : legacy?.[3].replace(/\.$/, "");
+  return {
+    id: typeof details.id === "string" ? details.id : legacy?.[2],
+    name: typeof details.name === "string" ? details.name : legacy?.[1] ?? "Subagent",
+    run: typeof details.run === "number" ? details.run : undefined,
+    question, questionIds, state,
+    summary: typeof details.summary === "string" ? details.summary : body.join("\n"),
+  };
+}
+function noticeSummary(source: string, question: boolean): string {
+  const line = clean(source).split("\n").map(line => line.trim()).find(line => line &&
+    !/^(Use subagent_control\b|Session:|Stopping is not acceptance:)/.test(line));
+  let summary = line ?? (question ? "Open details to review the question." : "No report text yet.");
+  if (question) summary = summary.replace(/^[A-Za-z0-9-]+:\s*/, "");
+  return inline(summary.replace(/\b[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}\b/gi, "")
+    .replace(/^#{1,6}\s+/, ""));
+}
+function noticeStatus(snapshot: NonNullable<ReturnType<typeof noticeSnapshot>>, record?: TaskRecord): { label: string; color: "accent" | "warning" | "success" | "error" | "muted" } {
+  const terminal = (state?: string) => {
+    if (state === "completed") return { label: "Completed", color: "success" } as const;
+    if (state === "failed") return { label: "Failed", color: "error" } as const;
+    if (state === "cancelled") return { label: "Cancelled", color: "muted" } as const;
+    return undefined;
+  };
+  if (!snapshot.question) return terminal(snapshot.state) ?? { label: "Update", color: "accent" };
+  if (!record) return { label: "Question", color: "warning" };
+  if (snapshot.run !== undefined && snapshot.run !== record.run || snapshot.run === undefined && record.run > 1) {
+    return { label: "Previous run", color: "muted" };
+  }
+  const outcome = terminal(record.state);
+  if (outcome) return outcome;
+  const questions = record.questions.filter(q => snapshot.questionIds.includes(q.id));
+  if (questions.some(q => !q.responseSent)) return { label: "Awaiting answer", color: "warning" };
+  return questions.length ? { label: "Answer sent", color: "accent" } : { label: "Answered", color: "success" };
+}
+export function resultRenderer(message: NoticeMessage, options: { expanded: boolean; outputPad?: number }, theme?: Theme,
+  resolveRecord?: (id: string) => TaskRecord | undefined): Text {
+  const content = clean(String(message.content));
+  const [heading = "", ...body] = content.split("\n");
   const title = inline(heading) || "Subagent update";
-  const preview = options.expanded ? body : body.slice(0, 4);
+  const snapshot = noticeSnapshot(message, heading, body);
   const text = new Text("", 0, 0);
   const render = text.render.bind(text);
   text.render = (width: number): string[] => {
     if (width <= 0) return [];
     const pad = Math.min(Math.max(0, Math.floor(options.outputPad ?? 0)), Math.floor((width - 1) / 2));
-    // Collapse the title only in the preview; expansion preserves the full report.
-    const titleLine = options.expanded ? `Subagents ─ ${title}` : truncateToWidth(`Subagents ─ ${title}`, width - pad * 2);
-    text.setText([
-      theme ? theme.fg("accent", titleLine) : titleLine,
-      ...preview,
-      ...(!options.expanded ? [theme ? theme.fg("muted", "/subagents for details · expand for full report") : "/subagents for details · expand for full report"] : []),
-    ].join("\n"));
-    return render(width - pad * 2).map(line => truncateToWidth(" ".repeat(pad) + line + " ".repeat(pad), width));
+    const available = width - pad * 2;
+    const fg = (color: Parameters<Theme["fg"]>[0], value: string) => theme ? theme.fg(color, value) : value;
+    if (snapshot) {
+      // Pi caches this component, not its lines. Resolve state on every render so
+      // an answered question updates in place, including during idle widget ticks.
+      const record = snapshot.id ? resolveRecord?.(snapshot.id) : undefined;
+      const status = noticeStatus(snapshot, record);
+      const header = fg(status.color, truncateToWidth(`Subagents · ${status.label}`, available));
+      if (options.expanded) {
+        text.setText([header, fg("muted", "Original notification"), content].join("\n"));
+      } else {
+        const summary = noticeSummary(snapshot.summary, snapshot.question);
+        const wrapped = wrapTextWithAnsi(summary, available);
+        const preview = wrapped.slice(0, 2);
+        if (wrapped.length > 2) preview[1] = truncateToWidth(preview[1] + "…", available);
+        text.setText([header, fg("text", truncateToWidth(inline(snapshot.name), available)),
+          ...preview.map(line => fg("text", line)),
+          fg("muted", truncateToWidth("/subagents · expand for full report", available))].join("\n"));
+      }
+    } else {
+      // Non-task messages (including workflows) retain their existing rendering.
+      const titleLine = options.expanded ? `Subagents ─ ${title}` : truncateToWidth(`Subagents ─ ${title}`, available);
+      text.setText([fg("accent", titleLine), ...(options.expanded ? body : body.slice(0, 4)),
+        ...(!options.expanded ? [fg("muted", "/subagents for details · expand for full report")] : [])].join("\n"));
+    }
+    return render(available).map(line => truncateToWidth(" ".repeat(pad) + line + " ".repeat(pad), width));
   };
   return text;
 }

@@ -116,6 +116,89 @@ test("result renderer preserves collapse and safely fits narrow CJK terminals", 
   }
 });
 
+test("subagent notices collapse into a compact card and retain the full original when expanded", () => {
+  const id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const qid = "11111111-2222-3333-4444-555555555555";
+  const content = `Subagent auth work (${id}) needs an answer:\n${qid}: 补丁测试通过，请验证真实调用。\n` +
+    "完整背景\n".repeat(30) + "DETAIL_END\nUse subagent_control action=answer with id, questionId, message.";
+  const message = { customType: "rpc_subagent_question", content,
+    details: { id, name: "auth work", state: "waiting", run: 1, questionIds: [qid] } };
+  const record: any = { ...setup().record, id, state: "waiting", questions: [{ id: qid, title: "补丁测试通过，请验证真实调用。" }] };
+  const lookup = () => record;
+  const collapsed = resultRenderer(message, { expanded: false }, undefined, lookup);
+  const lines = collapsed.render(80), preview = lines.map(line => line.trimEnd()).join("\n");
+  assert.match(preview, /Subagents · Awaiting answer\nauth work\n补丁测试通过，请验证真实调用。/);
+  assert.doesNotMatch(preview, /aaaaaaaa|11111111|Use subagent_control|DETAIL_END|完整背景/);
+  assert.ok(lines.length <= 5);
+  const expanded = resultRenderer(message, { expanded: true }, undefined, lookup).render(120).join("\n");
+  for (const text of [id, qid, "DETAIL_END", "Use subagent_control"]) assert.ok(expanded.includes(text));
+});
+
+test("question cards follow answers and task completion at render time", () => {
+  const t = setup(); t.record.state = "waiting";
+  t.record.questions = [{ id: "q-id", title: "Which interface?" }];
+  const message = { customType: "rpc_subagent_question",
+    content: "Subagent auth work (task-id) needs an answer:\nq-id: Which interface?\nUse subagent_control action=answer with id, questionId, message.",
+    details: { id: "task-id", name: "auth work", state: "waiting", run: 1, questionIds: ["q-id"] } };
+  const component = resultRenderer(message, { expanded: false }, undefined, () => t.record);
+  assert.match(component.render(80).join("\n"), /Awaiting answer/);
+  t.record.questions[0].responseSent = true;
+  assert.match(component.render(80).join("\n"), /Answer sent/);
+  assert.doesNotMatch(component.render(80).join("\n"), /Awaiting answer|needs an answer/);
+  t.record.questions = []; t.record.state = "running";
+  assert.match(component.render(80).join("\n"), /Answered/);
+  t.record.state = "completed";
+  assert.match(component.render(80).join("\n"), /Completed/);
+  t.record.state = "cancelled";
+  assert.match(component.render(80).join("\n"), /Cancelled/);
+  t.record.run = 2; t.record.state = "waiting"; t.record.questions = [{ id: "q-next", title: "New decision?" }];
+  assert.match(component.render(80).join("\n"), /Previous run/);
+  assert.doesNotMatch(component.render(80).join("\n"), /Awaiting answer|New decision/);
+});
+
+test("legacy question notices are compact and unresolved history does not claim a live pending question", () => {
+  const t = setup(); t.record.state = "completed";
+  const content = "Subagent auth work (task-id) needs an answer:\nq-id: Which interface?\nUse subagent_control action=answer with id, questionId, message.";
+  const component = resultRenderer({ content, details: { id: "task-id", state: "waiting" } },
+    { expanded: false }, undefined, () => t.record);
+  assert.match(component.render(80).map(line => line.trimEnd()).join("\n"), /Subagents · Completed\nauth work/);
+  assert.doesNotMatch(component.render(80).join("\n"), /task-id|q-id|subagent_control/);
+  const historical = resultRenderer({ content }, { expanded: false }).render(80).join("\n");
+  assert.match(historical, /Subagents · Question/);
+  assert.doesNotMatch(historical, /Awaiting answer|needs an answer/);
+});
+
+test("result cards summarize reports without reclassifying an older completed run", () => {
+  const t = setup(); t.record.state = "running"; t.record.run = 2;
+  const message = { customType: "rpc_subagent_result",
+    content: "Subagent auth work (task-id) completed.\n\n\nTests passed.\n" + "Full report\n".repeat(20) +
+      "Session: /tmp/session.jsonl\nStopping is not acceptance: review its validation and shared-workspace changes.",
+    details: { id: "task-id", name: "auth work", state: "completed", run: 1, summary: "Tests passed." } };
+  const preview = resultRenderer(message, { expanded: false }, undefined, () => t.record).render(80).map(line => line.trimEnd()).join("\n");
+  assert.match(preview, /Subagents · Completed\nauth work\nTests passed\./);
+  assert.doesNotMatch(preview, /task-id|Full report|Session:|Stopping is not acceptance|running/);
+});
+
+test("compact cards bound long CJK summaries and sanitize controls across resize and theme changes", () => {
+  const message = { customType: "rpc_subagent_result", content: "Original full report",
+    details: { id: "task-id", name: "中文🙂".repeat(30) + "\x1b]0;evil\x07", state: "failed", run: 1,
+      summary: "错误说明中文🙂 ".repeat(100) + "\x1b[2J\x00" } };
+  let code = "31";
+  const theme: any = { fg: (_color: string, text: string) => `\x1b[${code}m${text}\x1b[0m` };
+  const component = resultRenderer(message, { expanded: false, outputPad: 3 }, theme);
+  for (const width of [0, 1, 2, 3, 8, 20, 80]) {
+    const lines = component.render(width);
+    assert.ok(lines.length <= 5);
+    for (const line of lines) {
+      assert.ok(visibleWidth(line) <= width);
+      assert.doesNotMatch(stripTerminalSequences(line), /evil|[\x00-\x1f\x7f-\x9f]/);
+    }
+  }
+  code = "32"; component.invalidate();
+  assert.match(component.render(80).join("\n"), /\x1b\[32m/);
+  assert.doesNotMatch(component.render(80).join("\n"), /\x1b\[31m/);
+});
+
 test("empty and historical widget state clears the installed widget", () => {
   const t = setup(), display = new TaskWidget();
   t.manager.records.clear();

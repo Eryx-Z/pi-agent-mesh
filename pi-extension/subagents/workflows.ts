@@ -106,7 +106,7 @@ export class WorkflowManager {
     taskPrompt("workflow", "full", input.context, input.contextText);
     if (input.workspace !== undefined && !["shared", "isolated"].includes(input.workspace)) throw new Error("Invalid workspace mode");
     if (input.workspace === "isolated" && !input.validationCommand?.trim()) throw new Error("Isolated workflows require validationCommand");
-    const maxParallel = input.maxParallel ?? 3;
+    const maxParallel = input.maxParallel ?? 8;
     if (!Number.isInteger(maxParallel) || maxParallel < 1 || maxParallel > 16) throw new Error("maxParallel must be 1–16");
     const r: WorkflowRecord = { ...structuredClone(input), version: 1, id: randomUUID(),
       name: uniqueName(input.name ?? "workflow", [...this.records.values()].map(r => r.name)),

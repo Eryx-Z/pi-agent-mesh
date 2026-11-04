@@ -6,7 +6,7 @@ import { CHILD_EXTENSION, validateLoadout, applyAccess, accessMode, type AccessM
 import { atomicWrite, addLog, bounded, uniqueName, TaskStore, type TaskRecord } from "./store.ts";
 import { COOPERATION, seedSession, taskPrompt, type ContextMode } from "./context.ts";
 import type { AgentMessage } from "./context.ts";
-import { diagnoseFailure } from "./diagnostics.ts";
+import { diagnoseFailure, isTransportFailure } from "./diagnostics.ts";
 import { SystemdExecutionController, readProcessIdentity, isProcessIdentityAlive, type ExecutionController } from "./execution.ts";
 import { acquireExecutionLease, type ExecutionLease } from "./lease.ts";
 
@@ -55,6 +55,14 @@ export function childLaunch(record: TaskRecord, dir: string, command: string, ba
 function text(message: any): string {
   return typeof message?.content === "string" ? message.content : (message?.content ?? []).filter((b: any) => b.type === "text").map((b: any) => b.text).join("\n");
 }
+function assistantPreview(message: any): string {
+  const visible = text(message);
+  if (visible.trim()) return visible;
+  return (message?.content ?? []).filter((b: any) => b?.type === "thinking" && typeof b.thinking === "string").map((b: any) => b.thinking).join("\n");
+}
+function canRecoverTransport(record: TaskRecord): boolean {
+  return !!record.execution && !record.workflow && (record.recoveryRuns ?? 0) < 1 && isTransportFailure(record.error);
+}
 export class TaskManager {
   readonly records = new Map<string, TaskRecord>();
   private live = new Map<string, LiveRun>();
@@ -66,7 +74,7 @@ export class TaskManager {
   private listeners = new Set<() => void>();
   subscribe(listener: () => void): () => void { this.listeners.add(listener); return () => { this.listeners.delete(listener); }; }
   isLive(id: string): boolean { return this.live.has(id); }
-  hasCapacity(): boolean { return [...this.records.values()].filter(r => !r.stopped).length < (this.options.maxConcurrent ?? 8); }
+  hasCapacity(): boolean { return [...this.records.values()].filter(r => !r.stopped).length < (this.options.maxConcurrent ?? 16); }
   /** Acquire directory ownership before task/workflow loading can mutate anything. */
   static async open(store: TaskStore, options: ManagerOptions): Promise<TaskManager> {
     if (process.platform !== "linux") return new TaskManager(store, options);
@@ -89,7 +97,7 @@ export class TaskManager {
     } catch (error) { await lease.release(); throw error; }
   }
   constructor(readonly store: TaskStore, private options: ManagerOptions) {
-    if (!Number.isInteger(options.maxConcurrent ?? 8) || (options.maxConcurrent ?? 8) < 1) throw new Error("maxConcurrent must be a positive integer");
+    if (!Number.isInteger(options.maxConcurrent ?? 16) || (options.maxConcurrent ?? 16) < 1) throw new Error("maxConcurrent must be a positive integer");
     for (const record of store.load()) this.records.set(record.id, record);
   }
   assertOwnership(): void {
@@ -191,7 +199,8 @@ export class TaskManager {
       this.assertOwnership();
       if (this.closed || live.finishing) throw new Error("Parent session closed during startup");
       if (record.execution) { record.execution.ready = true; this.save(record); }
-      await rpc.request("set_auto_retry", { enabled: false });
+      // set_auto_retry writes the shared agent settings file. Do not force it off or on.
+      // A transport drop resumes once through execution recovery instead.
       phase = live.startupPhase = "loadout preflight";
       const commands = await rpc.request("get_commands");
       if (!commands?.commands?.some((c: { name: string }) => c.name === "rpc-subagent-preflight")) throw new Error("Child bridge did not load; refusing to send any model prompt");
@@ -223,7 +232,7 @@ export class TaskManager {
     }
     if (event.type === "message_start" && event.message?.role === "assistant") record.output = "";
     if (event.type === "message_end" && event.message?.role === "assistant") {
-      record.output = bounded(text(event.message)); live.lastStop = event.message.stopReason; live.lastError = event.message.errorMessage;
+      record.output = bounded(assistantPreview(event.message)); live.lastStop = event.message.stopReason; live.lastError = event.message.errorMessage;
       live.finalTools = new Map((event.message.content ?? []).filter((b: any) => b.type === "toolCall").map((b: any) => [b.id, false]));
       live.finalOutput.clear();
       addLog(record, `Assistant: ${record.output}`);
@@ -291,7 +300,9 @@ export class TaskManager {
         const terminated = live.lastStop === "toolUse" && live.finalTools.size > 0 && [...live.finalTools.values()].every(Boolean);
         if (terminated) record.output = bounded([record.output, ...[...live.finalTools.keys()].map(id => live.finalOutput.get(id))].filter(Boolean).join("\n"));
         const final = live.lastStop === "aborted" ? "cancelled" : live.lastStop === "stop" || terminated ? "completed" : "failed";
-        void this.finish(record, final, final === "failed" ? live.lastError ?? `Run settled with stopReason=${live.lastStop ?? "missing"}` : undefined);
+        if (final === "failed") record.error = live.lastError;
+        const recover = final === "failed" && canRecoverTransport(record);
+        void this.finish(record, final, final === "failed" ? live.lastError ?? `Run settled with stopReason=${live.lastStop ?? "missing"}` : undefined, recover);
       }
     }).catch(e => { if (!live.finishing) void this.finish(record, "failed", String(e)); })
       .finally(() => {

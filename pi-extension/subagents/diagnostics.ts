@@ -1,5 +1,13 @@
 import type { Loadout } from "./loadout.ts";
 
+// Provider/transport failures that pi-ai already treats as retryable network drops.
+// Quota, auth, and ordinary provider errors stay out of this set.
+const TRANSPORT_FAILURE = /(?:^|[^a-z0-9])(?:terminated|connection error|connection refused|connection lost|fetch failed|socket hang up|socket connection was closed|other side closed|reset before headers|network error|upstream connect|websocket closed|websocket error|stream ended before message_stop|stream ended before a terminal response event|http2 request did not get a response|pending stream has been canceled|getaddrinfo|enotfound|eai_again|econnreset|econnrefused|etimedout)(?:$|[^a-z0-9])/i;
+
+export function isTransportFailure(error: string | undefined): boolean {
+  return !!error && TRANSPORT_FAILURE.test(error);
+}
+
 // Classify only known signals; retain the original error rather than guessing a cause.
 export function diagnoseFailure(error: string, loadout: Loadout, phase?: string): string {
   let category: string, hint: string;
